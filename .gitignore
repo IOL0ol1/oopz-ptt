@@ -6,3 +6,7 @@ dist/
 .idea/
 *.user
 *.suo
+.workbuddy/
+
+# 一次性调试/像素探测脚本，本地归档保留，不进版本库
+tools/debug/

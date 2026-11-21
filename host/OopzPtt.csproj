@@ -11,7 +11,7 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>app.ico</ApplicationIcon>
 
-    <Version>0.2.2</Version>
+    <Version>0.2.7</Version>
     <Product>Oopz PTT</Product>
     <Description>Oopz 网页版按键说话本地助手</Description>
     <Copyright>Copyright (c) 2026 IOL0ol1</Copyright>

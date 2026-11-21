@@ -1,19 +1,30 @@
 // Oopz 按键说话 - 页面脚本
-// 扩展以 MAIN world 注入，油猴脚本也直接使用这份代码。
+// 扩展以 MAIN world 注入；油猴脚本使用同一份代码（构建时把 TRANSPORT 改成 ws）。
+//
+// 分区（自上而下，依赖单向）：
+//   常量 → 单实例守卫 → 运行时状态 → 工具 → 广告拦截 → 配置 → 麦克风闸门
+//   → RTC 旁听 → 传输 → 页面内按键 → 按键名称 → 像素探针 → 定位 → 状态机
+//   → 界面 → 扫描巡检 → 启动
 (() => {
   'use strict';
 
-  const VERSION = '0.2.2';
-  // 传输方式：扩展为 bridge（经扩展后台转发，不触发本地网络权限提示）
-  // 打包油猴脚本时替换为 ws（页面直接连本地助手）
+  /* ════════════════════ 构建常量 ════════════════════ */
+
+  const VERSION = '0.2.7';
+  // 扩展为 bridge（经扩展后台转发，不触发浏览器的本地网络授权提示）
+  // 油猴脚本构建时替换为 ws（页面直接连本地助手）
   const TRANSPORT = 'bridge';
   const BRIDGE_TAG = '__oopzPtt';
   const IS_BRIDGE = TRANSPORT === 'bridge';
   const IS_WS = !IS_BRIDGE;
 
-  // 扩展和油猴脚本允许同时安装：两者注入的是同一份脚本、同一个 world，只让先到的一方
-  // 生效，后来的一方主动让位，并把可能已建立的连接清理掉，避免出现两套界面或一条
-  // 没人接收的助手连接。
+  const HOST_URL = 'ws://127.0.0.1:29271/';
+  const HOME_URL = 'https://github.com/IOL0ol1/oopz-ptt';
+  const STORE_KEY = 'oopz-ptt';
+
+  /* ════════════════════ 单实例守卫 ════════════════════ */
+  // 扩展和油猴脚本可以同时安装：两者注入同一份脚本、同一个 world，只让先到的一方生效，
+  // 后来的一方让位并清掉自己可能已建立的连接，避免出现两套界面或一条没人接收的助手连接。
   if (window.__oopzPtt) {
     if (IS_BRIDGE) {
       window.__oopzPttExt = VERSION;
@@ -24,25 +35,22 @@
     return;
   }
 
-  const HOST_URL = 'ws://127.0.0.1:29271/';
-  const HOME_URL = 'https://github.com/IOL0ol1/oopz-ptt';
-  const STORE_KEY = 'oopz-ptt';
+  /* ════════════════════ 运行时状态 ════════════════════ */
 
   const S = {
     cfg: { mode: 'free', binding: null, delay: 200 },
-    dirty: false,
+    dirty: false,        // 与助手未连接时改过配置，连上后补发
     host: false,
     hostVersion: '',
-    held: false,
-    open: false,
+    held: false,         // 快捷键是否按住
+    open: false,         // 麦克风闸门是否放行（按下 + 释放延迟期内）
     learning: false,
-    level: 0,
+    level: 0,            // 实际发送的音量 0~1，用于绿点外发光
   };
 
   window.__oopzPtt = { version: VERSION, state: S, transport: TRANSPORT };
 
-  // 声明自己这一侧的存在，供对方让位时识别；bridge 侧还要请求后台建立连接
-  // （bridge.js 是惰性的，只有收到 want 才会连本地助手）
+  // 声明本侧身份，供对方让位时识别。bridge.js 是惰性的，收到 want 才连助手。
   if (IS_BRIDGE) {
     window.__oopzPttExt = VERSION;
     try { window.postMessage({ [BRIDGE_TAG]: 'want' }, location.origin); } catch (e) { }
@@ -50,22 +58,52 @@
     window.__oopzPttUser = VERSION;
   }
 
-  /* ============ 屏蔽首页广告接口 ============ */
-  // Oopz 的开屏推广浮层和首页横幅都由 /advertisement/v2/list 下发。它们整块画在
-  // Flutter 画布上，DOM 里没有节点可删，也没有"浮层出现"事件可以监听，只能在数据
-  // 源头拦掉。实测网络层拦掉这个请求后，浮层和横幅都不再出现，页面其余功能正常。
-  // 这里在页面脚本之前把请求截断，扩展和油猴跑的是同一份代码，两边都生效。
+  /* ════════════════════ 定位与显示参数 ════════════════════ */
+  // 所有与 Oopz 画面坐标相关的常量集中在这里。Oopz 改版或窗口缩放异常时只调这一处。
+  const LOCATE = {
+    // 顶栏「麦克风 + 耳机 + 挂断」胶囊的横向扫描行。x 不能写死到图标上：
+    // 窗口缩放不是 100% 时整个顶栏会平移，写死会扫到耳机甚至头像。
+    micRow: { x: 112, y: 31, w: 320 },
+    // 以图标中心为基准的纵向投影窗口（左右各 5px、从 y=18 起 26px 高）
+    micBox: { dx: -5, y: 18, w: 11, h: 26 },
+    // 圆点写死坐标。实测（2560x1440、页面缩放约 1.28）：房外图标 cx≈201、房内≈169，top 一致。
+    // 换分辨率/缩放或 Oopz 改版后这两个值需要重新实测。
+    badge: { top: 38, out: 207, in: 175 },
+    // 房内外分界：图标 cx 小于此值视为在房间内（169 房内 / 201 房外，取中点）
+    inRoomMaxCx: 185,
+    // 语音设置页「语音输入模式」单选钮的扫描区域
+    voiceBlock: { x: 270, y: 60, w: 64 },
+    // 面板各行相对「自由发言」单选钮圆心的纵向偏移，按 Oopz 1.4.x 实测
+    panelRows: { radio: 0, hint: 29, header: 96, keys: 128 },
+  };
 
-  const AD_URL = /\/advertisement\/v\d+\/list/;
+  // 圆点只有三态
+  const STATE_COLOR = { talk: '#67dd0d', muted: 'var(--bad)', armed: '#8c8c8c' };
+
+  /* ════════════════════ 通用工具 ════════════════════ */
+
+  const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const diff = (a, b) => Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]) + Math.abs(a[2] - b[2]);
+  const isAccent = (p) => p[2] > 180 && p[2] - p[0] > 90;
+  const luma = (p) => 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2];
+  // 饱和度：设置页背景是中性灰，彩色卡片（活动 banner、广告位）饱和度很高
+  const chroma = (p) => Math.max(p[0], p[1], p[2]) - Math.min(p[0], p[1], p[2]);
+
+  /* ════════════════════ 屏蔽首页广告接口 ════════════════════ */
+  // 开屏推广浮层和首页横幅都由 /advertisement/v2/list 下发，整块画在 Flutter 画布上，
+  // DOM 里没有节点可删、也没有「浮层出现」事件可监听，只能在数据源头截断。
+  // 按网络失败处理，页面已验证能正常降级。
 
   (() => {
+    const AD_URL = /\/advertisement\/v\d+\/list/;
+
     try {
-      const of = window.fetch;
-      if (typeof of === 'function') {
+      const origFetch = window.fetch;
+      if (typeof origFetch === 'function') {
         window.fetch = function (input) {
           const url = typeof input === 'string' ? input : input && input.url;
           if (url && AD_URL.test(url)) return Promise.reject(new TypeError('Failed to fetch'));
-          return of.apply(this, arguments);
+          return origFetch.apply(this, arguments);
         };
       }
     } catch (e) { }
@@ -79,7 +117,6 @@
       };
       XMLHttpRequest.prototype.send = function () {
         if (!this.__oopzAd) return XS.apply(this, arguments);
-        // 按网络失败处理，和请求被 block 的表现一致，页面已验证能正常降级
         try {
           Object.defineProperty(this, 'readyState', { configurable: true, get: () => 4 });
           Object.defineProperty(this, 'status', { configurable: true, get: () => 0 });
@@ -94,7 +131,9 @@
     } catch (e) { }
   })();
 
-  /* ============ 配置 ============ */
+  /* ════════════════════ 配置 ════════════════════ */
+  // 本地缓存用于页面刷新后立即可用；连接上助手后以助手的配置为准（助手是权威）。
+  // 这里的归一化只做容错，规则必须与 host/Settings.cs 的 Normalize 保持一致。
 
   function loadCfg() {
     try {
@@ -132,19 +171,19 @@
     S.cfg = next;
     if (!send({ t: 'set', cfg: msg })) S.dirty = true;
     saveCfg();
-    if (!S.host) localReset();
+    if (!S.host) pageReset();
     applyGate();
   }
 
   loadCfg();
 
-  /* ============ 麦克风闸门 ============ */
-  // 只改原始采集轨道的 enabled。对页面暴露的 enabled 仍是页面自己设置的值，
-  // 实际值 = 页面的值 && 闸门，这样不会覆盖 Oopz 自己的闭麦。
+  /* ════════════════════ 麦克风闸门 ════════════════════ */
+  // 只改原始采集轨道的 enabled。对页面暴露的 enabled 仍是 Oopz 自己设置的值，
+  // 实际启用 = 页面的值 && 闸门，所以不会覆盖 Oopz 自己的闭麦逻辑。
 
   const enabledDesc = Object.getOwnPropertyDescriptor(MediaStreamTrack.prototype, 'enabled');
   const tracks = new Set();
-  const wants = new WeakMap();
+  const wants = new WeakMap();   // track → Oopz 想设置的值
 
   function gateOpen() {
     return S.cfg.mode !== 'ptt' || S.open;
@@ -160,13 +199,13 @@
       set(v) {
         wants.set(track, !!v);
         enabledDesc.set.call(track, !!v && gateOpen());
-        render();
+        schedulePaint();
       },
     });
     tracks.add(track);
     enabledDesc.set.call(track, wants.get(track) && gateOpen());
-    track.addEventListener('ended', () => { tracks.delete(track); render(); });
-    render();
+    track.addEventListener('ended', () => { tracks.delete(track); schedulePaint(); });
+    schedulePaint();
   }
 
   function liveTracks() {
@@ -181,7 +220,7 @@
   function applyGate() {
     const g = gateOpen();
     for (const t of liveTracks()) enabledDesc.set.call(t, wants.get(t) && g);
-    render();
+    schedulePaint();
   }
 
   function adoptStream(stream) {
@@ -193,9 +232,9 @@
   }
 
   // Oopz 的 trtc.js / iris-web-rtc 会把 getUserMedia 覆盖成 navigator.mediaDevices 的
-  // 实例自有属性，直接绕过原型补丁（实测原型被调用 0 次）。因此不在 getUserMedia 函数
-  // 本身上做包装（SDK 会读回包装函数再包回去，形成递归），改为在「轨道被真正使用」的
-  // 层面拦截：SDK 无论怎么采集，最终一定要取 audio track 并加进 RTC 连接，这里全面覆盖。
+  // 实例自有属性，绕过原型补丁。所以不在 getUserMedia 本身做包装（SDK 会读回包装函数
+  // 再包一层，形成递归），改为在「轨道被真正使用」的层面接管：SDK 无论怎么采集，
+  // 最终都要取 audio track 并加进 RTC 连接。
 
   const origGetUserMedia = MediaDevices.prototype.getUserMedia;
   MediaDevices.prototype.getUserMedia = function (constraints) {
@@ -205,7 +244,6 @@
     });
   };
 
-  // 取轨道时接管：getAudioTracks / getTracks
   (() => {
     const MS = window.MediaStream;
     if (!MS || !MS.prototype) return;
@@ -227,8 +265,7 @@
     }
   })();
 
-  // 轨道进入 RTCPeerConnection 时接管：addTrack / addTransceiver
-  // SDK 若绕过 getUserMedia 且直接持有 track，这里仍能拦到最终发送的那一路。
+  // SDK 若绕过 getUserMedia 且直接持有 track，这里仍能拦到最终进入连接的那一路。
   (() => {
     const RTC = window.RTCPeerConnection;
     if (!RTC || !RTC.prototype) return;
@@ -255,7 +292,52 @@
     return c;
   };
 
-  /* ============ 旁听 RTC 调用，判断 Oopz 自己是否闭麦 ============ */
+  /* ════════════════════ 音量（绿点外发光） ════════════════════ */
+  // 分析"实际在发送"的那一路轨道：页面 want 为真且闸门放行。这样静音或被闸门关掉时
+  // 电平自然是 0，不会出现"没在发声音、光晕却在跳"。
+  // AudioContext 受浏览器自动播放策略限制，用户交互前是 suspended，此时电平保持 0。
+
+  let actx = null;
+  let analyser = null;
+  let meterTrack = null;
+  let meterNode = null;
+  let meterBuf = null;
+
+  function meterTick() {
+    const t = liveTracks().find((x) => wants.get(x) && gateOpen()) || null;
+    if (t !== meterTrack) {
+      try { if (meterNode) meterNode.disconnect(); } catch (e) { }
+      meterNode = null;
+      meterTrack = t;
+      if (t) {
+        try {
+          if (!actx) {
+            actx = new AudioContext();
+            analyser = actx.createAnalyser();
+            analyser.fftSize = 512;
+            meterBuf = new Float32Array(analyser.fftSize);
+          }
+          meterNode = actx.createMediaStreamSource(new MediaStream([t]));
+          meterNode.connect(analyser);
+        } catch (e) { meterNode = null; }
+      }
+    }
+
+    let level = 0;
+    if (meterNode && actx && actx.state === 'running') {
+      analyser.getFloatTimeDomainData(meterBuf);
+      let sum = 0;
+      for (let i = 0; i < meterBuf.length; i++) sum += meterBuf[i] * meterBuf[i];
+      level = Math.min(1, Math.sqrt(sum / meterBuf.length) * 6);
+    } else if (actx && actx.state === 'suspended' && meterNode) {
+      actx.resume().catch(() => { });
+    }
+    if (ui) ui.setLevel(level);
+  }
+
+  setInterval(meterTick, 100);
+
+  /* ════════════════════ 旁听 RTC，判断 Oopz 自己是否闭麦 ════════════════════ */
 
   const rtcMute = {};
 
@@ -275,7 +357,7 @@
     else if (ev.includes('muteRecordingSignal')) { key = 'rec'; field = 'mute'; }
     else if (ev.includes('leaveChannel')) {
       delete rtcMute.stream; delete rtcMute.local; delete rtcMute.rec;
-      render();
+      schedulePaint();
       return;
     }
     if (!key) return;
@@ -283,7 +365,7 @@
       const d = JSON.parse(p.data);
       if (field in d) {
         rtcMute[key] = invert ? !d[field] : !!d[field];
-        render();
+        schedulePaint();
       }
     } catch (e) { }
   }
@@ -320,7 +402,7 @@
     const upd = inst.updateLocalAudio;
     if (typeof upd === 'function') {
       inst.updateLocalAudio = function (o) {
-        if (o && typeof o === 'object' && 'mute' in o) { rtcMute.trtc = !!o.mute; render(); }
+        if (o && typeof o === 'object' && 'mute' in o) { rtcMute.trtc = !!o.mute; schedulePaint(); }
         return upd.apply(this, arguments);
       };
     }
@@ -329,7 +411,7 @@
       if (typeof f === 'function') {
         inst[m] = function () {
           delete rtcMute.trtc;
-          render();
+          schedulePaint();
           return f.apply(this, arguments);
         };
       }
@@ -338,110 +420,84 @@
 
   setInterval(hookRtc, 1500);
 
-  /* ============ 实际发送的音量 ============ */
-
-  let actx = null;
-  let analyser = null;
-  let meterTrack = null;
-  let meterNode = null;
-  let meterBuf = null;
-
-  function meterTick() {
-    const live = liveTracks();
-    const t = live.length ? live[live.length - 1] : null;
-    if (t !== meterTrack) {
-      try { if (meterNode) meterNode.disconnect(); } catch (e) { }
-      meterNode = null;
-      meterTrack = t;
-      if (t) {
-        try {
-          if (!actx) {
-            actx = new AudioContext();
-            analyser = actx.createAnalyser();
-            analyser.fftSize = 512;
-            meterBuf = new Float32Array(analyser.fftSize);
-          }
-          meterNode = actx.createMediaStreamSource(new MediaStream([t]));
-          meterNode.connect(analyser);
-        } catch (e) { meterNode = null; }
-      }
-    }
-    let level = 0;
-    if (meterNode && actx && actx.state === 'running') {
-      analyser.getFloatTimeDomainData(meterBuf);
-      let sum = 0;
-      for (let i = 0; i < meterBuf.length; i++) sum += meterBuf[i] * meterBuf[i];
-      level = Math.min(1, Math.sqrt(sum / meterBuf.length) * 6);
-    } else if (actx && actx.state === 'suspended' && meterNode) {
-      actx.resume().catch(() => { });
-    }
-    if (Math.abs(level - S.level) > 0.02 || (level === 0 && S.level !== 0)) {
-      S.level = level;
-      render();
-    }
-  }
-
-  setInterval(meterTick, 100);
-
-  /* ============ 本地助手 ============ */
+  /* ════════════════════ 与本地助手的传输 ════════════════════ */
+  // 两种实现共用一组回调：onUp（连上）/ onDown（断开）/ onMessage（业务消息）。
+  // 扩展走 bridge.js 转发（页面不需要本地网络权限），油猴由页面直连并处理重连与授权探测。
 
   let ws = null;
-  let retry = 0;
+  let retryCount = 0;
   let retryTimer = 0;
-  let lna = '';
+  let lna = '';   // 浏览器「访问本设备上的应用」权限状态，仅 ws 模式使用
 
-  // 扩展：经 bridge.js 转发，bridge.js 连上本地助手后回传 __up，这时再打招呼。
-  // 油猴：页面自己连 WebSocket。
-  function initTransport() {
+  function createTransport() {
     if (IS_BRIDGE) {
-      window.addEventListener('message', (e) => {
-        if (e.source !== window || !e.data || e.data[BRIDGE_TAG] !== 'in') return;
-        const m = e.data.m;
-        if (!m || typeof m.t !== 'string') return;
-        if (m.t === '__up') send({ t: 'hello', v: VERSION });
-        else if (m.t === '__down') hostDown();
-        else onHostMessage(m);
-      });
-      return;
+      return {
+        send(msg) {
+          try { window.postMessage({ [BRIDGE_TAG]: 'out', m: msg }, location.origin); } catch (e) { }
+          // bridge 是异步转发，无法立刻得知是否送达；已连接即视为送达
+          return S.host || msg.t === 'hello';
+        },
+        start(onUp, onDown, onMessage) {
+          window.addEventListener('message', (e) => {
+            if (e.source !== window || !e.data || e.data[BRIDGE_TAG] !== 'in') return;
+            const m = e.data.m;
+            if (!m || typeof m.t !== 'string') return;
+            if (m.t === '__up') onUp();
+            else if (m.t === '__down') onDown();
+            else onMessage(m);
+          });
+        },
+      };
     }
-    connectWs();
+
+    return {
+      send(msg) {
+        if (!ws || ws.readyState !== 1) return false;
+        ws.send(JSON.stringify(msg));
+        return true;
+      },
+      start(onUp, onDown, onMessage) {
+        const connect = () => {
+          clearTimeout(retryTimer);
+          let sock;
+          try { sock = new WebSocket(HOST_URL); } catch (e) { reconnect(); return; }
+          ws = sock;
+          sock.onopen = () => { retryCount = 0; onUp(); };
+          sock.onmessage = (e) => {
+            let m;
+            try { m = JSON.parse(e.data); } catch (err) { return; }
+            onMessage(m);
+          };
+          sock.onclose = () => {
+            if (ws !== sock) return;
+            ws = null;
+            onDown();
+            reconnect();
+          };
+          sock.onerror = () => { };
+        };
+        const reconnect = () => {
+          retryCount = Math.min(retryCount + 1, 8);
+          retryTimer = setTimeout(connect, Math.min(1000 * retryCount, 8000));
+          checkLna();
+        };
+        connect();
+      },
+    };
   }
 
-  function connectWs() {
-    clearTimeout(retryTimer);
-    let sock;
-    try { sock = new WebSocket(HOST_URL); } catch (e) { reconnectLater(); return; }
-    ws = sock;
-    sock.onopen = () => {
-      retry = 0;
-      sock.send(JSON.stringify({ t: 'hello', v: VERSION }));
-    };
-    sock.onmessage = (e) => {
-      let m;
-      try { m = JSON.parse(e.data); } catch (err) { return; }
-      onHostMessage(m);
-    };
-    sock.onclose = () => {
-      if (ws !== sock) return;
-      ws = null;
-      hostDown();
-      reconnectLater();
-    };
-    sock.onerror = () => { };
+  const transport = createTransport();
+
+  function send(msg) {
+    return transport.send(msg);
   }
 
-  function reconnectLater() {
-    retry = Math.min(retry + 1, 8);
-    retryTimer = setTimeout(connectWs, Math.min(1000 * retry, 8000));
-    checkLna();
-  }
-
-  // 油猴脚本模式下，查询浏览器是否拦截了对本机的访问，用于界面提示
+  // 查询浏览器是否拦截了对本机的访问，用于界面提示（仅 ws 模式会有意义）
   async function checkLna() {
     for (const name of ['loopback-network', 'local-network-access']) {
       try {
         const st = (await navigator.permissions.query({ name })).state;
-        if (st !== lna) { lna = st; render(); }
+        if (st !== lna) { lna = st; schedulePaint(); }
         return;
       } catch (e) { }
     }
@@ -457,24 +513,15 @@
     if (was) toast('本地助手已断开');
   }
 
-  function send(o) {
-    if (IS_BRIDGE) {
-      window.postMessage({ [BRIDGE_TAG]: 'out', m: o }, location.origin);
-      return S.host || o.t === 'hello';
-    }
-    if (!ws || ws.readyState !== 1) return false;
-    ws.send(JSON.stringify(o));
-    return true;
-  }
-
   function onHostMessage(m) {
     switch (m.t) {
       case 'state': {
         const first = !S.host;
         S.host = true;
         S.hostVersion = m.v || '';
-        localReset();
+        pageReset();
         if (first && S.dirty) {
+          // 离线期间的改动在首次连上时补发给助手
           S.dirty = false;
           const c = S.cfg;
           send({ t: 'set', cfg: c.binding ? { mode: c.mode, delay: c.delay, binding: c.binding } : { mode: c.mode, delay: c.delay, clearBinding: true } });
@@ -495,23 +542,23 @@
       case 'learned':
         S.learning = false;
         if (m.binding) toast('快捷键已设为 ' + bindingName(m.binding));
-        render();
+        schedulePaint();
         break;
       case 'learnEnd':
         S.learning = false;
-        render();
+        schedulePaint();
         break;
     }
   }
 
-  /* ============ 页面内按键（助手未连接时的退路） ============ */
+  /* ════════════════════ 页面内按键（助手未连接时的退路） ════════════════════ */
 
-  const local = { held: false, timer: 0, learnMod: 0 };
+  const pageKey = { held: false, timer: 0, learnMod: 0 };
 
-  function localReset() {
-    clearTimeout(local.timer);
-    if (local.held || (!S.host && S.open)) {
-      local.held = false;
+  function pageReset() {
+    clearTimeout(pageKey.timer);
+    if (pageKey.held || (!S.host && S.open)) {
+      pageKey.held = false;
       S.held = false;
       S.open = false;
     }
@@ -534,40 +581,40 @@
 
   const isModifierVk = (vk) => (vk >= 0xA0 && vk <= 0xA5) || vk === 0x5B || vk === 0x5C;
 
-  function localActive() {
+  function pageActive() {
     return !S.host && S.cfg.mode === 'ptt' && !!S.cfg.binding;
   }
 
-  function localPress() {
-    clearTimeout(local.timer);
-    if (local.held) return;
-    local.held = true;
+  function pagePress() {
+    clearTimeout(pageKey.timer);
+    if (pageKey.held) return;
+    pageKey.held = true;
     S.held = true;
     S.open = true;
     applyGate();
   }
 
-  function localRelease() {
-    if (!local.held) return;
-    local.held = false;
+  function pageRelease() {
+    if (!pageKey.held) return;
+    pageKey.held = false;
     S.held = false;
     const d = S.cfg.delay;
     if (d <= 0) {
       S.open = false;
       applyGate();
     } else {
-      render();
-      local.timer = setTimeout(() => { S.open = false; applyGate(); }, d);
+      schedulePaint();
+      pageKey.timer = setTimeout(() => { S.open = false; applyGate(); }, d);
     }
   }
 
-  function finishLocalLearn(binding) {
+  function finishPageLearn(binding) {
     S.learning = false;
     if (binding) {
       setCfg({ binding });
       toast('快捷键已设为 ' + bindingName(binding));
     }
-    render();
+    schedulePaint();
   }
 
   window.addEventListener('keydown', (e) => {
@@ -576,14 +623,14 @@
       e.stopPropagation();
       if (S.host || e.repeat) return;
       const vk = vkFromEvent(e);
-      if (vk === 27) { finishLocalLearn(null); return; }
-      if (isModifierVk(vk)) { local.learnMod = vk; return; }
-      finishLocalLearn({ dev: 'kb', code: vk, mods: modsFromEvent(e) });
+      if (vk === 27) { finishPageLearn(null); return; }
+      if (isModifierVk(vk)) { pageKey.learnMod = vk; return; }
+      finishPageLearn({ dev: 'kb', code: vk, mods: modsFromEvent(e) });
       return;
     }
-    if (!localActive() || e.repeat) return;
+    if (!pageActive() || e.repeat) return;
     const b = S.cfg.binding;
-    if (b.dev === 'kb' && vkFromEvent(e) === b.code && (modsFromEvent(e) & b.mods) === b.mods) localPress();
+    if (b.dev === 'kb' && vkFromEvent(e) === b.code && (modsFromEvent(e) & b.mods) === b.mods) pagePress();
   }, true);
 
   window.addEventListener('keyup', (e) => {
@@ -592,32 +639,32 @@
       e.stopPropagation();
       if (S.host) return;
       const vk = vkFromEvent(e);
-      if (local.learnMod && vk === local.learnMod) finishLocalLearn({ dev: 'kb', code: vk, mods: 0 });
+      if (pageKey.learnMod && vk === pageKey.learnMod) finishPageLearn({ dev: 'kb', code: vk, mods: 0 });
       return;
     }
     const b = S.cfg.binding;
-    if (localActive() && b.dev === 'kb' && vkFromEvent(e) === b.code) localRelease();
+    if (pageActive() && b.dev === 'kb' && vkFromEvent(e) === b.code) pageRelease();
   }, true);
 
   window.addEventListener('mousedown', (e) => {
     const code = MOUSE_CODE[e.button];
     if (S.learning && !S.host && code) {
       e.preventDefault();
-      finishLocalLearn({ dev: 'mouse', code, mods: modsFromEvent(e) });
+      finishPageLearn({ dev: 'mouse', code, mods: modsFromEvent(e) });
       return;
     }
     const b = S.cfg.binding;
-    if (localActive() && b.dev === 'mouse' && b.code === code) localPress();
+    if (pageActive() && b.dev === 'mouse' && b.code === code) pagePress();
   }, true);
 
   window.addEventListener('mouseup', (e) => {
     const b = S.cfg.binding;
-    if (localActive() && b.dev === 'mouse' && b.code === MOUSE_CODE[e.button]) localRelease();
+    if (pageActive() && b.dev === 'mouse' && b.code === MOUSE_CODE[e.button]) pageRelease();
   }, true);
 
-  window.addEventListener('blur', () => { if (local.held) localRelease(); });
+  window.addEventListener('blur', () => { if (pageKey.held) pageRelease(); });
 
-  /* ============ 按键名称 ============ */
+  /* ════════════════════ 按键名称 ════════════════════ */
 
   const VK_NAMES = {
     0x08: 'Backspace', 0x09: 'Tab', 0x0D: 'Enter', 0x13: 'Pause', 0x14: 'CapsLock', 0x1B: 'Esc', 0x20: '空格',
@@ -649,26 +696,16 @@
     return mods.concat(main).join(' + ');
   }
 
-  /* ============ 麦克风实际状态 ============ */
-
-  function micState() {
-    const ptt = S.cfg.mode === 'ptt';
-    const live = liveTracks();
-    if (!live.length) return ptt ? (S.host ? 'armed' : 'offline') : 'none';
-    if (!live.some((t) => wants.get(t)) || rtcMuted()) return 'muted';
-    if (!gateOpen()) return S.host ? 'armed' : 'offline';
-    if (!ptt) return 'talk';
-    return S.held ? 'talk' : 'tail';
-  }
-
-  /* ============ 读取 Flutter 画布像素 ============ */
-  // Oopz 网页版是 Flutter 画布渲染，DOM 里没有任何界面元素，只能通过像素定位。
+  /* ════════════════════ 像素探针 ════════════════════ */
+  // Oopz 网页版是 Flutter 画布渲染，DOM 里没有可查询的控件，界面定位只能读画布像素。
 
   const probe = (() => {
+    let cached = null;
     let oc = null;
     let og = null;
 
     function canvas() {
+      if (cached && cached.isConnected && cached.width) return cached;
       const gp = document.querySelector('flt-glass-pane');
       const root = gp && gp.shadowRoot;
       if (!root) return null;
@@ -676,6 +713,7 @@
       for (const c of root.querySelectorAll('canvas')) {
         if (c.width && (!best || c.width * c.height > best.width * best.height)) best = c;
       }
+      cached = best;
       return best;
     }
 
@@ -708,94 +746,108 @@
     return { canvas, read };
   })();
 
-  const diff = (a, b) => Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]) + Math.abs(a[2] - b[2]);
-  const isAccent = (p) => p[2] > 180 && p[2] - p[0] > 90;
-  const luma = (p) => 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2];
-  // 饱和度：设置页背景是中性灰，彩色卡片（活动 banner、广告位）饱和度很高
-  const chroma = (p) => Math.max(p[0], p[1], p[2]) - Math.min(p[0], p[1], p[2]);
+  /* ════════════════════ 定位结果 ════════════════════ */
+  // 唯一真相：状态机与界面都从这里读，不再依赖 UI 闭包里的变量。
 
-  // 顶栏左侧「麦克风 + 耳机 + 挂断」胶囊里的麦克风图标
-  // 这个图标是细线轮廓、内部空心，颜色还会随静音/开麦在灰绿之间变化，所以既不能找
-  // "连续宽色块"，也不能靠形状或颜色识别。做法分三步：
-  //   1. 取一列，用胶囊的蓝色描边定位上下边界（描边是品牌色，不随状态变）
-  //   2. 在胶囊中心行找出胶囊左边界（不能写死 x：窗口缩放不是 100% 时坐标会整体偏移，
-  //      写死的话会直接跳到耳机甚至头像上）
-  //   3. 在胶囊内部做列投影，第一个有足够像素的列簇就是麦克风图标
+  const loc = { mic: null, voice: null };
+
+  const inRoom = () => !!(loc.mic && loc.mic.cx < LOCATE.inRoomMaxCx);
+
+  /* ════════════════════ 顶栏麦克风图标 ════════════════════ */
+  // 图标是细线轮廓、内部空心，颜色随静音/开麦变化，既不能找连续色块也不能靠颜色识别。
+  // 定位分三步：
+  //   1. 在固定行横扫，找胶囊左边界（胶囊底色是一段均匀色块）
+  //   2. 从胶囊左边界起做列投影，第一个足够宽的列簇就是麦克风图标 → 得到 cx
+  //   3. 以 cx 为中心做多行投影，求图标上下边界与静音形态
+  // 图标 x 不能写死：窗口缩放不是 100% 时整个顶栏会平移。
+
   function findMic() {
-    const col = probe.read(150, 0, 1, 60);
-    if (!col) return null;
-    let top = -1;
-    let bottom = -1;
-    for (let y = 0; y < col.h; y++) {
-      const p = col.at(0, y);
-      if (p[2] > 90 && p[2] - p[0] > 40) {
-        if (top < 0) top = y;
-        bottom = y;
-      }
+    const row = probe.read(LOCATE.micRow.x, LOCATE.micRow.y, LOCATE.micRow.w, 1);
+    if (!row) return null;
+    const bg = row.at(0, 0);
+    const run = Math.round(8 * row.s);
+    let L = -1;
+    for (let i = 1; i < row.w - run; i++) {
+      const p = row.at(i, 0);
+      if (diff(p, bg) < 10) continue;
+      let uniform = true;
+      for (let j = 1; j <= run; j++) if (diff(row.at(i + j, 0), p) > 6) { uniform = false; break; }
+      if (uniform) { L = i; break; }
     }
-    if (top < 0 || bottom - top < 10) return null;
-    const pillTop = col.y0 + top / col.s;
-    const pillBottom = col.y0 + (bottom + 1) / col.s;
-    const pillH = pillBottom - pillTop;
-    if (pillH < 8) return null;
-    const cy = (pillTop + pillBottom) / 2;
+    if (L < 0) return null;
+    const pill = row.at(L, 0);
 
-    // 胶囊左边界：从 logo 右侧起扫，找到第一段与页面背景不同的像素
-    const scan = probe.read(85, Math.round(cy), 220, 1);
-    if (!scan) return null;
-    const pageBg = scan.at(0, 0);
-    let Lpx = -1;
-    for (let i = 0; i < scan.w; i++) {
-      if (diff(scan.at(i, 0), pageBg) > 12) { Lpx = i; break; }
-    }
-    if (Lpx < 0) return null;
-    const left = scan.x0 + Lpx / scan.s;
-
-    const by = Math.round(pillTop + 3);
-    const bh = Math.max(6, Math.round(pillH - 6));
-    const blk = probe.read(left + 5, by, 200, bh);
-    if (!blk) return null;
-    const pill = blk.at(2, Math.round(blk.h / 2));
-
-    // 图标之间相隔约 15px，图标内部空隙更大，用 10px 空白作为分界；
-    // 细线图标单列可能只有 1~2 个像素，所以阈值取 2
-    const gapMin = Math.round(10 * blk.s);
+    // 第一个足够宽的图标像素段，过窄的视为噪点
+    const tol = 26;
+    const maxGap = Math.round(3 * row.s);
+    const minW = Math.round(5 * row.s);
     let g0 = -1;
     let g1 = -1;
-    let zero = 0;
-    for (let x = 0; x < blk.w; x++) {
-      let n = 0;
-      for (let y = 0; y < blk.h; y++) if (diff(blk.at(x, y), pill) > 30) n++;
-      if (n >= 2) {
-        if (g0 < 0) g0 = x;
-        g1 = x;
-        zero = 0;
-      } else if (g0 >= 0 && ++zero > gapMin) {
-        break;
+    let gap = 0;
+    for (let i = L; i < row.w; i++) {
+      if (diff(row.at(i, 0), pill) > tol) {
+        if (g0 < 0) g0 = i;
+        g1 = i;
+        gap = 0;
+      } else if (g0 >= 0 && ++gap > maxGap) {
+        if (g1 + 1 - g0 >= minW) break;
+        g0 = -1; g1 = -1; gap = 0;
       }
     }
-    if (g0 < 0) return null;
-    const iw = (g1 + 1 - g0) / blk.s;
-    if (iw < 4 || iw > 30) return null;
-    return {
-      cx: blk.x0 + (g0 + g1 + 1) / 2 / blk.s,
-      cy,
-      left,
-      pill,
-      bg: pill,
-      w: iw,
-      h: Math.max(8, pillH - 8),
-    };
+    if (g0 < 0 || g1 < 0) return null;
+    const w = (g1 + 1 - g0) / row.s;
+    if (w < 4 || w > 26) return null;
+    const cx = row.x0 + (g0 + g1 + 1) / 2 / row.s;
+    const left = row.x0 + L / row.s;
+
+    // 多行投影求上下边界。单列扫描穿过图标空心处会得到 h=1 的假值。
+    const B = LOCATE.micBox;
+    const box = probe.read(cx + B.dx, B.y, B.w, B.h);
+    if (!box) return null;
+    const rowHits = [];
+    for (let y = 0; y < box.h; y++) {
+      let hit = 0;
+      for (let x = 0; x < box.w; x++) if (diff(box.at(x, y), pill) > 22) hit++;
+      rowHits.push(hit);
+    }
+    // 取连续命中段（忽略零散噪点），阈值取列宽的 1/4
+    const need = Math.max(1, Math.floor(box.w / 4));
+    let top = -1, bottom = -1, runStart = -1;
+    for (let y = 0; y <= rowHits.length; y++) {
+      const on = y < rowHits.length && rowHits[y] >= need;
+      if (on && runStart < 0) runStart = y;
+      if (!on && runStart >= 0) {
+        if (y - runStart >= 2) { if (top < 0) top = runStart; bottom = y - 1; }
+        runStart = -1;
+      }
+    }
+
+    let cy, h;
+    let iconMuted = false;
+    if (top >= 0) {
+      cy = box.y0 + (top + bottom + 1) / 2 / box.s;
+      h = (bottom + 1 - top) / box.s;
+      // 静音识别：开麦时话筒主体内部空心、静音时有一条斜杠穿过。
+      // 取主体中心第 3~6 行的命中数（11 列宽实测：开麦≈2、静音≈4）。
+      // 顶部两行是麦克风网格帽子，两种状态命中都高，不能当基准。
+      let mid = 0, n = 0;
+      for (let y = top + 3; y <= Math.min(top + 6, bottom); y++) { mid += rowHits[y]; n++; }
+      mid = n ? mid / n : 0;
+      iconMuted = mid >= box.w * 0.28;
+    } else {
+      cy = 31; h = 0;   // 兜底：顶栏图标中心常在 y≈31
+    }
+    return { cx, cy, left, pill, bg, w, h, iconMuted };
   }
 
-  // 语音设置页「语音输入模式」下的「自由发言」单选钮
-  // 单选钮是一个直径 5~14px 的孤立圆点。这里必须严格校验几何形状：
-  // 只放宽高会让主界面左上角任意一块蓝色小图形（头像、状态点、图标）被误认成单选钮，
-  // 面板就会莫名其妙弹在那里。所以额外要求宽高比接近 1、左右留白充足（孤立），
-  // 并且上方留白，排除大图标内部的一小块蓝色。
+  /* ════════════════════ 语音设置页「自由发言」单选钮 ════════════════════ */
+  // 单选钮是直径 5~14px 的孤立圆点。必须严格校验几何：只放宽高会让主界面左上角
+  // 任意一块蓝色小图形（头像、状态点、图标）被误认，面板就会弹在错误位置。
+  // 额外要求宽高比接近 1、左右留白充足、上下留白，排除大图标内部的小蓝块。
+
   function findVoiceRadio() {
-    const X0 = 270;
-    const blk = probe.read(X0, 60, 64, innerHeight - 60);
+    const V = LOCATE.voiceBlock;
+    const blk = probe.read(V.x, V.y, V.w, innerHeight - V.y);
     if (!blk) return null;
     const pad = Math.max(2, Math.round(5 * blk.s));
     let st = -1;
@@ -820,17 +872,15 @@
         const h = (y - st) / blk.s;
         const w = (maxX + 1 - minX) / blk.s;
         const ratio = w / h;
-        // 孤立圆点：左右都要有背景留白，宽度受限，形状接近圆形
         const isolated = minX >= pad && (blk.w - 1 - maxX) >= pad;
         if (h >= 5 && h <= 14 && w >= 4 && w <= 20 && ratio >= 0.55 && ratio <= 1.9 && isolated) {
           const px = Math.round((minX + maxX) / 2);
-          const ci = Math.round(((blk.y0 + (st + y) / 2 / blk.s) - blk.y0) * blk.s);
-          // 背景色取左侧留白，避免取样点正好落在别的图形上（会把主题染成那块图形的颜色）
+          const ci = Math.round((st + y) / 2);
+          // 背景取左侧留白，避免取样点落在别的图形上（会把主题染成那块图形的颜色）
           const bg = blk.at(Math.max(0, minX - pad - 1), ci);
-          // 背景必须是中性色。设置页是灰阶底，而主界面的活动卡片/广告位是彩色的，
-          // 卡片里的小图标不能当单选钮（否则面板会染成卡片色弹在卡片上）
+          // 背景必须是中性色：设置页是灰阶底，主界面的彩色卡片里的小图标不能当单选钮
           if (chroma(bg) > 36) { st = -1; minX = Infinity; maxX = -1; continue; }
-          // 上下留白：单选钮所在的设置项行，上下都应是背景；大图标内部的小蓝块过不了这一关
+          // 上下留白：单选钮所在行上下都应是背景；大图标内部的小蓝块过不了这一关
           const gap = Math.max(3, Math.round(5 * blk.s));
           const up = st - gap;
           const dn = y + gap;
@@ -849,7 +899,35 @@
     return null;
   }
 
-  /* ============ 界面 ============ */
+  /* ════════════════════ 麦克风状态机（纯函数） ════════════════════ */
+  // 圆点三态：talk(绿) / armed(灰) / muted(红)
+  //   禁用麦克风    → muted，优先级最高，房间内外、按不按键都一样
+  //   自由发言·使能 → talk
+  //   按键说话·使能 → 闸门打开期间 talk，关闭后 armed
+  // 闸门 S.open 按下时置真、释放延迟结束才置假，所以"释放延迟后才变灰"是它的自然结果。
+  //
+  // 禁用信号有三路：图标静音形态、轨道 want、RTC 上报。
+  // 图标形态只在房间外用：房间内说话时图标有音量波形动画，中心命中数会在阈值附近跳动，
+  // 导致状态反复切换、圆点红绿闪烁；房间内有 track/RTC 这两个可靠信号。
+
+  function micSignals() {
+    const live = liveTracks();
+    return {
+      iconMuted: !inRoom() && !!(loc.mic && loc.mic.iconMuted),
+      tracksMuted: live.length > 0 && !live.some((t) => wants.get(t)),
+      rtcMuted: rtcMuted(),
+      mode: S.cfg.mode,
+      open: S.open,
+    };
+  }
+
+  function micState(sig) {
+    if (sig.iconMuted || sig.tracksMuted || sig.rtcMuted) return 'muted';
+    if (sig.mode !== 'ptt') return 'talk';
+    return sig.open ? 'talk' : 'armed';
+  }
+
+  /* ════════════════════ 界面 ════════════════════ */
 
   const FONT = "'oopz-ptt-font', 'PingFang SC', 'Microsoft YaHei UI', 'Microsoft YaHei', sans-serif";
 
@@ -883,16 +961,32 @@ a { color: var(--accent); text-decoration: none; cursor: pointer; }
 a:hover { text-decoration: underline; }
 .badge { position: absolute; display: none; width: 0; height: 0; }
 .badge.show { display: block; }
-.badge i { position: absolute; left: -5px; top: -5px; width: 7px; height: 7px; border-radius: 50%; border: 2px solid var(--pill);
-  background: #8c8c8c; transition: box-shadow .1s, background-color .15s; }
+/* 与 Oopz 头像上的在线点同尺寸（约 5px）、纯色、无描边；光晕只在绿点（正在发送）时由 JS 添加 */
+.badge i { position: absolute; left: -2.5px; top: -2.5px; width: 5px; height: 5px; border-radius: 50%;
+  background: #8c8c8c; transition: background-color .15s, box-shadow .08s linear; }
 .toast { position: absolute; left: 50%; bottom: 48px; transform: translateX(-50%); background: rgba(30,30,30,.96); color: var(--fg1);
   border: 1px solid #333; border-radius: 8px; padding: 8px 14px; font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; }
 .toast.show { opacity: 1; }
 .light .toast { background: rgba(255,255,255,.98); border-color: #ddd; }
 `;
 
-  // 相对「自由发言」单选钮圆心的纵向位置，按 Oopz 1.4.x 实测
-  const ROW = { radio: 0, hint: 29, header: 96, keys: 128 };
+  function statusHtml() {
+    const ptt = S.cfg.mode === 'ptt';
+    if (S.host) {
+      const v = S.hostVersion ? ` v${S.hostVersion}` : '';
+      return `<span class="dot" style="background:var(--ok)"></span>本地助手已连接${v}，` +
+        (ptt ? `在任何程序中按住&nbsp;<b>${esc(bindingName(S.cfg.binding))}</b>&nbsp;即可说话` : '选择按键说话后，按住快捷键才会发送声音');
+    }
+    const warn = '<span class="dot" style="background:var(--warn)"></span>';
+    if (IS_WS && lna === 'denied') {
+      return warn + '浏览器拦截了本页对本机程序的访问，请在网站设置中允许「本设备上的应用」后刷新';
+    }
+    if (IS_WS && lna === 'prompt') {
+      return warn + '如果浏览器询问是否允许访问本设备上的应用，请选择「允许」';
+    }
+    const dl = `<a href="${HOME_URL}/releases/latest" target="_blank" rel="noopener">下载本地助手</a>`;
+    return warn + '未连接本地助手，快捷键只在本页面处于前台时有效。' + dl;
+  }
 
   function buildControls(el) {
     el.innerHTML = `
@@ -919,6 +1013,7 @@ a:hover { text-decoration: underline; }
       e.preventDefault();
       if (S.cfg.binding) setCfg({ binding: null });
     });
+
     let sendTimer = 0;
     range.addEventListener('input', () => {
       const v = range.value | 0;
@@ -929,7 +1024,7 @@ a:hover { text-decoration: underline; }
     });
 
     let lastRange = -1;
-    return function update() {
+    return function updatePanel() {
       radios.forEach((r) => r.classList.toggle('on', r.dataset.mode === S.cfg.mode));
       keyBtn.classList.toggle('learn', S.learning);
       keyBtn.textContent = S.learning ? '请按下按键…（Esc 取消）' : bindingName(S.cfg.binding);
@@ -944,43 +1039,23 @@ a:hover { text-decoration: underline; }
     };
   }
 
-  function statusHtml() {
-    const ptt = S.cfg.mode === 'ptt';
-    if (S.host) {
-      const v = S.hostVersion ? ` v${S.hostVersion}` : '';
-      return `<span class="dot" style="background:var(--ok)"></span>本地助手已连接${v}，` +
-        (ptt ? `在任何程序中按住&nbsp;<b>${esc(bindingName(S.cfg.binding))}</b>&nbsp;即可说话` : '选择按键说话后，按住快捷键才会发送声音');
-    }
-    const warn = '<span class="dot" style="background:var(--warn)"></span>';
-    if (IS_WS && lna === 'denied') {
-      return warn + '浏览器拦截了本页对本机程序的访问，请在网站设置中允许「本设备上的应用」后刷新';
-    }
-    if (IS_WS && lna === 'prompt') {
-      return warn + '如果浏览器询问是否允许访问本设备上的应用，请选择「允许」';
-    }
-    const dl = `<a href="${HOME_URL}/releases/latest" target="_blank" rel="noopener">下载本地助手</a>`;
-    return warn + '未连接本地助手，快捷键只在本页面处于前台时有效。' + dl;
-  }
-
-  const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-
   function startLearn() {
     S.learning = true;
-    local.learnMod = 0;
+    pageKey.learnMod = 0;
     if (S.host) send({ t: 'learn' });
     clearTimeout(startLearn.timer);
     startLearn.timer = setTimeout(() => { if (S.learning) cancelLearn(); }, 15000);
-    render();
+    schedulePaint();
   }
 
   function cancelLearn() {
     S.learning = false;
     if (S.host) send({ t: 'learnCancel' });
-    render();
+    schedulePaint();
   }
 
   let ui = null;
-  // 右键会弹出 Oopz 自己的竖排菜单，脚本面板如果还留在原地就会和它叠在一起
+  // 右键会弹出 Oopz 自己的竖排语音菜单，脚本面板如果还留在原地会和它叠在一起
   let inlineSuspended = false;
 
   function createUi() {
@@ -1000,10 +1075,11 @@ a:hover { text-decoration: underline; }
     const inline = root.querySelector('.inline');
     const toastEl = root.querySelector('.toast');
 
-    const updInline = buildControls(inline);
-    // 面板顶部 = 圆心 - 14，每行高 28，所以行的 top 就等于该行中心相对圆心的偏移
+    const updatePanel = buildControls(inline);
+    // 面板顶部 = 圆心 - 14，每行高 28，所以行的 top 就是该行中心相对圆心的偏移
     const rows = inline.querySelectorAll('.row');
-    [ROW.radio, ROW.hint, ROW.header, ROW.keys].forEach((y, i) => { rows[i].style.top = y + 'px'; });
+    const R = LOCATE.panelRows;
+    [R.radio, R.hint, R.header, R.keys].forEach((y, i) => { rows[i].style.top = y + 'px'; });
 
     for (const t of ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu', 'keydown', 'keyup']) {
       inline.addEventListener(t, (e) => e.stopPropagation());
@@ -1023,9 +1099,6 @@ a:hover { text-decoration: underline; }
       }
     }, { passive: false });
 
-    let anchorVoice = null;
-    let anchorMic = null;
-
     function applyTheme(bg, pill, accent) {
       const light = luma(bg) > 140;
       layer.classList.toggle('light', light);
@@ -1041,52 +1114,71 @@ a:hover { text-decoration: underline; }
       set('--line2', light ? '#9a9a9a' : '#6b6b6b');
     }
 
-    function place() {
-      if (anchorMic) {
-        // 贴在图标右下角，和 Oopz 自己在头像角落画的在线点一致。
-        // 麦克风是斜线图形，中心那一列常常是空的，纵向量出来的高度会偏小，
-        // 所以高度按宽度估算兜底（顶栏图标大致是宽的 1.25 倍）。
-        const iw = anchorMic.w || 14;
-        const ih = Math.max(anchorMic.h || 0, iw * 1.25);
-        badge.style.left = (anchorMic.cx + iw / 2 - 2) + 'px';
-        badge.style.top = (anchorMic.cy + ih / 2 - 2) + 'px';
+    // 只摆位置：圆点与面板。位置只由锚点决定，与运行状态无关。
+    function layout() {
+      if (loc.mic) {
+        badge.style.left = (inRoom() ? LOCATE.badge.in : LOCATE.badge.out) + 'px';
+        badge.style.top = LOCATE.badge.top + 'px';
       }
-      if (anchorVoice && !inlineSuspended) {
-        const left = anchorVoice.cx - 7;
+      if (loc.voice && !inlineSuspended) {
+        const left = loc.voice.cx - 7;
         inline.style.left = left + 'px';
-        inline.style.top = (anchorVoice.cy - 14) + 'px';
+        inline.style.top = (loc.voice.cy - 14) + 'px';
         inline.style.width = Math.max(420, Math.min(600, innerWidth - left - 24)) + 'px';
-        inline.style.height = (ROW.keys + 30) + 'px';
+        inline.style.height = (LOCATE.panelRows.keys + 30) + 'px';
         inline.classList.add('show');
       } else {
         hideInline();
       }
-      update();
+    }
+
+    // 缓存当前状态，供 10Hz 的音量回调判断要不要画光晕
+    let currentState = 'armed';
+
+    // 绿点外发光：半径与透明度随实际发送音量变化。只在 talk（正在发送）时出现，
+    // 灰点/红点一律清掉，避免把"禁用"误读成"在说话"。
+    function applyGlow() {
+      if (currentState !== 'talk' || !loc.mic) {
+        badgeDot.style.boxShadow = 'none';
+        return;
+      }
+      const l = S.level;
+      const radius = 2 + l * 7;
+      const spread = 1 + l * 2;
+      const alpha = 0.25 + l * 0.55;
+      badgeDot.style.boxShadow = `0 0 ${radius.toFixed(1)}px ${spread.toFixed(1)}px rgba(103,221,13,${alpha.toFixed(2)})`;
+    }
+
+    // 只刷内容：圆点颜色与面板文字。状态变化走这里，不重复摆位置。
+    function paint() {
+      const st = micState(micSignals());
+      currentState = st;
+      badge.classList.toggle('show', !!loc.mic);
+      if (loc.mic) {
+        badgeDot.style.background = STATE_COLOR[st];
+        applyGlow();
+      }
+      if (inline.classList.contains('show')) updatePanel();
+    }
+
+    // 音量每 100ms 更新一次，只改光晕，不触发面板重绘
+    function setLevel(level) {
+      if (Math.abs(level - S.level) < 0.01) return;
+      S.level = level;
+      if (currentState === 'talk' && loc.mic) applyGlow();
+    }
+
+    function applyAnchors(mic, voice) {
+      loc.mic = mic;
+      loc.voice = voice;
+      const bg = (voice && voice.bg) || (mic && mic.bg);
+      if (bg) applyTheme(bg, mic && mic.pill, voice && voice.accent);
+      layout();
+      paint();
     }
 
     function hideInline() {
       inline.classList.remove('show');
-    }
-
-    function setAnchors(mic, voice) {
-      anchorMic = mic;
-      anchorVoice = voice;
-      const bg = (voice && voice.bg) || (mic && mic.bg);
-      if (bg) applyTheme(bg, mic && mic.pill, voice && voice.accent);
-      place();
-    }
-
-    function update() {
-      const st = micState();
-      const show = !!anchorMic && st !== 'none';
-      badge.classList.toggle('show', show);
-      if (show) {
-        const color = { talk: 'var(--ok)', tail: 'var(--ok)', muted: 'var(--bad)', offline: 'var(--warn)', armed: '#8c8c8c' }[st];
-        badgeDot.style.background = color;
-        const glow = st === 'talk' || st === 'tail' ? Math.round(2 + S.level * 6) : 0;
-        badgeDot.style.boxShadow = glow ? `0 0 0 ${glow}px rgba(59,165,92,${st === 'tail' ? 0.18 : 0.32})` : 'none';
-      }
-      if (inline.classList.contains('show')) updInline();
     }
 
     let toastTimer = 0;
@@ -1098,9 +1190,9 @@ a:hover { text-decoration: underline; }
     }
 
     return {
-      update, setAnchors, hideInline, showToast,
-      get anchorMic() { return anchorMic; },
-      get anchorVoice() { return anchorVoice; },
+      paint, layout, applyAnchors, hideInline, showToast, setLevel,
+      get mic() { return loc.mic; },
+      get voice() { return loc.voice; },
     };
   }
 
@@ -1108,17 +1200,18 @@ a:hover { text-decoration: underline; }
     if (ui) ui.showToast(text);
   }
 
-  let renderQueued = false;
-  function render() {
-    if (renderQueued || !ui) return;
-    renderQueued = true;
+  // 状态变化高频（按键、轨道、RTC），用 rAF 合并，一帧最多刷一次
+  let paintQueued = false;
+  function schedulePaint() {
+    if (paintQueued || !ui) return;
+    paintQueued = true;
     requestAnimationFrame(() => {
-      renderQueued = false;
-      ui.update();
+      paintQueued = false;
+      if (ui) ui.paint();
     });
   }
 
-  /* ============ 定位扫描 ============ */
+  /* ════════════════════ 定位巡检 ════════════════════ */
 
   let scanTimer = 0;
   let lastVoice = null;
@@ -1135,9 +1228,9 @@ a:hover { text-decoration: underline; }
       const same = lastVoice && Math.abs(voice.cx - lastVoice.cx) <= 4 && Math.abs(voice.cy - lastVoice.cy) <= 4;
       voiceHits = same ? voiceHits + 1 : 1;
       lastVoice = voice;
-      // 首次命中先在原位置复查一次，确认不是滚动、动画或相邻图形造成的误判
+      // 首次命中先复查一次，排除滚动、动画或相邻图形造成的误判
       if (voiceHits < 2) {
-        ui.setAnchors(mic, null);
+        ui.applyAnchors(mic, null);
         scheduleScan(160);
         return;
       }
@@ -1145,7 +1238,7 @@ a:hover { text-decoration: underline; }
       voiceHits = 0;
       lastVoice = null;
     }
-    ui.setAnchors(mic, voice);
+    ui.applyAnchors(mic, voice);
   }
 
   function scheduleScan(delay) {
@@ -1153,27 +1246,34 @@ a:hover { text-decoration: underline; }
     scanTimer = setTimeout(scan, delay);
   }
 
-  // 每秒核对一次锚点像素，页面切走就收起；顶栏和设置项都没找到时降到每 2 秒找一次
+  // 定时核对锚点是否还有效。顶栏和设置项都没找到时降低频率。
   let verifyTick = 0;
   function verify() {
     if (!ui || document.hidden) return;
-    const v = ui.anchorVoice;
-    const m = ui.anchorMic;
+    const v = ui.voice;
+    const m = ui.mic;
     if (!m && !v && ++verifyTick % 2 !== 0) return;
     let stale = false;
+    let fresh = null;
     try {
       if (v) {
         const p = probe.read(v.cx, v.cy, 1, 1);
         if (!p || !isAccent(p.at(0, 0))) stale = true;
       }
       if (m) {
-        const p = probe.read(m.left + 2, m.cy, 1, 1);
-        if (!p || diff(p.at(0, 0), m.pill) > 8) stale = true;
+        // 必须完整重定位：进出房时胶囊整体平移，只测 (left+2, cy) 一个点仍会落在胶囊
+        // 底色上，被误判为有效，圆点就滞留在旧位置。
+        fresh = findMic();
+        if (!fresh) stale = true;
+        else if (Math.abs(fresh.cx - m.cx) > 3 || Math.abs(fresh.cy - m.cy) > 3) stale = true;
       } else {
         stale = true;
       }
     } catch (e) { stale = true; }
-    if (stale) scan();
+    if (stale) { scan(); return; }
+    // 小幅位移直接更新，不等下一次交互事件；静音切换时 cx/cy 不变但 iconMuted 会变，
+    // 必须一并比较，否则红/灰状态不刷新。
+    if (fresh && (fresh.cx !== m.cx || fresh.cy !== m.cy || fresh.iconMuted !== m.iconMuted)) ui.applyAnchors(fresh, v);
   }
 
   async function loadFont() {
@@ -1194,20 +1294,20 @@ a:hover { text-decoration: underline; }
     }
   }
 
+  /* ════════════════════ 启动 ════════════════════ */
+
   function start() {
     if (ui) return;
     ui = createUi();
 
-    // 扩展和油猴脚本同时安装时，只有一份生效。对方让位时会留下标记，
-    // 稍后检查一次并提示，避免用户以为装重了会加倍生效。
+    // 扩展和油猴同时安装时只有一份生效，提示用户避免以为装重了会加倍生效
     setTimeout(() => {
       const other = IS_BRIDGE ? window.__oopzPttUser : window.__oopzPttExt;
       if (other) toast('检测到扩展和油猴脚本同时安装，当前只有一份生效，建议移除其中一个');
     }, 1500);
 
     const onPointerUp = () => { scheduleScan(250); setTimeout(scan, 900); };
-    // 右键：Oopz 会弹出自己的语音菜单，脚本面板先让开，避免两块 UI 叠在一起；
-    // 左键点回来后恢复显示。
+    // 右键：Oopz 会弹出自己的语音菜单，先让开面板；左键点回来再恢复
     window.addEventListener('pointerdown', (e) => {
       if (e.button === 2) {
         inlineSuspended = true;
@@ -1226,7 +1326,7 @@ a:hover { text-decoration: underline; }
     }, { capture: true, passive: true });
     window.addEventListener('resize', () => { ui.hideInline(); scheduleScan(300); });
     document.addEventListener('visibilitychange', () => { if (!document.hidden) scheduleScan(300); });
-    setInterval(verify, 1000);
+    setInterval(verify, 400);
 
     let fontTries = 0;
     const tryFont = () => loadFont().then((done) => { if (!done && ++fontTries < 20) setTimeout(tryFont, 1500); });
@@ -1234,14 +1334,19 @@ a:hover { text-decoration: underline; }
     scheduleScan(500);
   }
 
-  // 等 Flutter 画出第一帧再挂界面；页面结构变了也在 10 秒后挂上，至少保证托盘里的「打开设置」可用
+  // 等 Flutter 画出第一帧再挂界面；页面结构变了也在 10 秒后挂上，至少保证设置面板可用
   const bootAt = Date.now();
   function waitForFlutter() {
     if (probe.canvas() || Date.now() - bootAt > 10000) start();
     else setTimeout(waitForFlutter, 500);
   }
 
-  initTransport();
+  transport.start(
+    () => send({ t: 'hello', v: VERSION }),
+    hostDown,
+    onHostMessage,
+  );
+
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', waitForFlutter, { once: true });
   else waitForFlutter();
 })();

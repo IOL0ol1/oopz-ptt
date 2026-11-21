@@ -44,7 +44,8 @@ internal sealed unsafe class App
     uint _taskbarCreated;
     bool _trayAdded;
     IntPtr _trayIcon;
-    int _trayState = -1;
+    // 托盘缓存键：连接状态 + 发言模式。提示文字两者都依赖，任一变化都要重设图标。
+    int _trayKey = -1;
 
     bool _held;
     bool _open;
@@ -170,8 +171,9 @@ internal sealed unsafe class App
         }
         if (msg == _taskbarCreated && msg != 0)
         {
+            // 资源管理器重启后托盘图标会丢失，需要重新添加
             _trayAdded = false;
-            _trayState = -1;
+            _trayKey = -1;
             UpdateTray();
             return true;
         }
@@ -485,9 +487,13 @@ internal sealed unsafe class App
 
     void UpdateTray()
     {
+        // 0=未连接 1=已连接待机 2=正在说话
         int state = _ws.Count == 0 ? 0 : _open ? 2 : 1;
-        if (state == _trayState && _trayAdded) return;
-        _trayState = state;
+        // 「已连接」的提示文字还取决于发言模式，缓存键必须包含它，
+        // 否则切换自由发言/按键说话时托盘提示不会更新。
+        int key = (state << 1) | (S.Ptt ? 1 : 0);
+        if (key == _trayKey && _trayAdded) return;
+        _trayKey = key;
 
         int size = GetSystemMetrics(SM_CXSMICON);
         if (size <= 0) size = 16;
