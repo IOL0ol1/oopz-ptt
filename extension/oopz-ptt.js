@@ -2,9 +2,27 @@
 // 扩展以 MAIN world 注入，油猴脚本也直接使用这份代码。
 (() => {
   'use strict';
-  if (window.__oopzPtt) return;
 
-  const VERSION = '0.1.0';
+  const VERSION = '0.1.6';
+  // 传输方式：扩展为 bridge（经扩展后台转发，不触发本地网络权限提示）
+  // 打包油猴脚本时替换为 ws（页面直接连本地助手）
+  const TRANSPORT = 'bridge';
+  const BRIDGE_TAG = '__oopzPtt';
+  const IS_BRIDGE = TRANSPORT === 'bridge';
+
+  // 扩展和油猴脚本允许同时安装：两者注入的是同一份脚本、同一个 world，只让先到的一方
+  // 生效，后来的一方主动让位，并把可能已建立的连接清理掉，避免出现两套界面或一条
+  // 没人接收的助手连接。
+  if (window.__oopzPtt) {
+    if (IS_BRIDGE) {
+      window.__oopzPttExt = VERSION;
+      try { window.postMessage({ [BRIDGE_TAG]: 'release' }, location.origin); } catch (e) { }
+    } else {
+      window.__oopzPttUser = VERSION;
+    }
+    return;
+  }
+
   const HOST_URL = 'ws://127.0.0.1:29271/';
   const HOME_URL = 'https://github.com/IOL0ol1/oopz-ptt';
   const STORE_KEY = 'oopz-ptt';
@@ -20,7 +38,16 @@
     level: 0,
   };
 
-  window.__oopzPtt = { version: VERSION, state: S };
+  window.__oopzPtt = { version: VERSION, state: S, transport: TRANSPORT };
+
+  // 声明自己这一侧的存在，供对方让位时识别；bridge 侧还要请求后台建立连接
+  // （bridge.js 是惰性的，只有收到 want 才会连本地助手）
+  if (IS_BRIDGE) {
+    window.__oopzPttExt = VERSION;
+    try { window.postMessage({ [BRIDGE_TAG]: 'want' }, location.origin); } catch (e) { }
+  } else {
+    window.__oopzPttUser = VERSION;
+  }
 
   /* ============ 配置 ============ */
 
@@ -312,11 +339,6 @@
   setInterval(meterTick, 100);
 
   /* ============ 本地助手 ============ */
-  // 扩展：经 bridge.js 和扩展后台转发，不触发浏览器的本地网络权限提示。
-  // 油猴脚本：页面直接连 WebSocket，浏览器会询问一次是否允许访问本设备上的应用。
-
-  const TRANSPORT = 'bridge'; // 打包油猴脚本时替换为 'ws'
-  const BRIDGE_TAG = '__oopzPtt';
 
   let ws = null;
   let retry = 0;
@@ -646,6 +668,8 @@
   const diff = (a, b) => Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]) + Math.abs(a[2] - b[2]);
   const isAccent = (p) => p[2] > 180 && p[2] - p[0] > 90;
   const luma = (p) => 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2];
+  // 饱和度：设置页背景是中性灰，彩色卡片（活动 banner、广告位）饱和度很高
+  const chroma = (p) => Math.max(p[0], p[1], p[2]) - Math.min(p[0], p[1], p[2]);
 
   // 顶栏左侧「麦克风 + 耳机」胶囊里的麦克风图标
   function findMic() {
@@ -691,34 +715,61 @@
   }
 
   // 语音设置页「语音输入模式」下的「自由发言」单选钮
+  // 单选钮是一个直径 5~14px 的孤立圆点。这里必须严格校验几何形状：
+  // 只放宽高会让主界面左上角任意一块蓝色小图形（头像、状态点、图标）被误认成单选钮，
+  // 面板就会莫名其妙弹在那里。所以额外要求宽高比接近 1、左右留白充足（孤立），
+  // 并且上方留白，排除大图标内部的一小块蓝色。
   function findVoiceRadio() {
     const X0 = 270;
-    const blk = probe.read(X0, 60, 40, innerHeight - 60);
+    const blk = probe.read(X0, 60, 64, innerHeight - 60);
     if (!blk) return null;
+    const pad = Math.max(2, Math.round(5 * blk.s));
     let st = -1;
-    let sumX = 0;
-    let n = 0;
+    let minX = Infinity;
+    let maxX = -1;
     for (let y = 0; y <= blk.h; y++) {
-      let rowN = 0;
-      let rowX = 0;
+      let rowMin = Infinity;
+      let rowMax = -1;
       if (y < blk.h) {
-        for (let x = 0; x < blk.w; x++) if (isAccent(blk.at(x, y))) { rowN++; rowX += x; }
+        for (let x = 0; x < blk.w; x++) {
+          if (isAccent(blk.at(x, y))) {
+            if (x < rowMin) rowMin = x;
+            if (x > rowMax) rowMax = x;
+          }
+        }
       }
-      if (rowN) {
-        if (st < 0) st = y;
-        sumX += rowX;
-        n += rowN;
+      if (rowMax >= 0) {
+        if (st < 0) { st = y; minX = rowMin; maxX = rowMax; }
+        if (rowMin < minX) minX = rowMin;
+        if (rowMax > maxX) maxX = rowMax;
       } else if (st >= 0) {
         const h = (y - st) / blk.s;
-        if (h >= 5 && h <= 14) {
-          const cx = blk.x0 + sumX / n / blk.s;
-          const cy = blk.y0 + (st + y) / 2 / blk.s;
-          const ci = Math.round((cy - blk.y0) * blk.s);
-          const accent = blk.at(Math.round((cx - blk.x0) * blk.s), ci);
-          const bg = blk.at(0, Math.max(0, Math.round((cy - 20 - blk.y0) * blk.s)));
-          return { cx, cy, accent, bg };
+        const w = (maxX + 1 - minX) / blk.s;
+        const ratio = w / h;
+        // 孤立圆点：左右都要有背景留白，宽度受限，形状接近圆形
+        const isolated = minX >= pad && (blk.w - 1 - maxX) >= pad;
+        if (h >= 5 && h <= 14 && w >= 4 && w <= 20 && ratio >= 0.55 && ratio <= 1.9 && isolated) {
+          const px = Math.round((minX + maxX) / 2);
+          const ci = Math.round(((blk.y0 + (st + y) / 2 / blk.s) - blk.y0) * blk.s);
+          // 背景色取左侧留白，避免取样点正好落在别的图形上（会把主题染成那块图形的颜色）
+          const bg = blk.at(Math.max(0, minX - pad - 1), ci);
+          // 背景必须是中性色。设置页是灰阶底，而主界面的活动卡片/广告位是彩色的，
+          // 卡片里的小图标不能当单选钮（否则面板会染成卡片色弹在卡片上）
+          if (chroma(bg) > 36) { st = -1; minX = Infinity; maxX = -1; continue; }
+          // 上下留白：单选钮所在的设置项行，上下都应是背景；大图标内部的小蓝块过不了这一关
+          const gap = Math.max(3, Math.round(5 * blk.s));
+          const up = st - gap;
+          const dn = y + gap;
+          const upOk = up < 0 || diff(blk.at(px, up), bg) < 26;
+          const dnOk = dn >= blk.h || diff(blk.at(px, dn), bg) < 26;
+          if (upOk && dnOk) {
+            const cx = blk.x0 + (minX + maxX + 1) / 2 / blk.s;
+            const cy = blk.y0 + (st + y) / 2 / blk.s;
+            const accent = blk.at(px, ci);
+            return { cx, cy, accent, bg };
+          }
         }
-        st = -1; sumX = 0; n = 0;
+        st = -1; minX = Infinity; maxX = -1;
       }
     }
     return null;
@@ -1023,6 +1074,8 @@ a:hover { text-decoration: underline; }
   /* ============ 定位扫描 ============ */
 
   let scanTimer = 0;
+  let lastVoice = null;
+  let voiceHits = 0;
 
   function scan() {
     if (!ui) return;
@@ -1030,6 +1083,21 @@ a:hover { text-decoration: underline; }
     let voice = null;
     try { mic = findMic(); } catch (e) { }
     try { voice = findVoiceRadio(); } catch (e) { }
+
+    if (voice) {
+      const same = lastVoice && Math.abs(voice.cx - lastVoice.cx) <= 4 && Math.abs(voice.cy - lastVoice.cy) <= 4;
+      voiceHits = same ? voiceHits + 1 : 1;
+      lastVoice = voice;
+      // 首次命中先在原位置复查一次，确认不是滚动、动画或相邻图形造成的误判
+      if (voiceHits < 2) {
+        ui.setAnchors(mic, null);
+        scheduleScan(160);
+        return;
+      }
+    } else {
+      voiceHits = 0;
+      lastVoice = null;
+    }
     ui.setAnchors(mic, voice);
   }
 
@@ -1044,7 +1112,7 @@ a:hover { text-decoration: underline; }
     if (!ui || document.hidden) return;
     const v = ui.anchorVoice;
     const m = ui.anchorMic;
-    if (!m && !v && ++verifyTick % 3 !== 0) return;
+    if (!m && !v && ++verifyTick % 2 !== 0) return;
     let stale = false;
     try {
       if (v) {
@@ -1082,6 +1150,13 @@ a:hover { text-decoration: underline; }
   function start() {
     if (ui) return;
     ui = createUi();
+
+    // 扩展和油猴脚本同时安装时，只有一份生效。对方让位时会留下标记，
+    // 稍后检查一次并提示，避免用户以为装重了会加倍生效。
+    setTimeout(() => {
+      const other = IS_BRIDGE ? window.__oopzPttUser : window.__oopzPttExt;
+      if (other) toast('检测到扩展和油猴脚本同时安装，当前只有一份生效，建议移除其中一个');
+    }, 1500);
 
     const onPointerUp = () => { scheduleScan(250); setTimeout(scan, 900); };
     window.addEventListener('pointerup', onPointerUp, true);

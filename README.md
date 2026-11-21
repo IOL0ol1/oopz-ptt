@@ -15,17 +15,38 @@
 | --- | --- |
 | `OopzPtt.exe` | 本地助手，常驻托盘，负责监听全局按键。单文件原生程序，不需要安装任何运行库 |
 | `extension/` | 浏览器扩展（推荐），把功能注入 Oopz 网页 |
-| `oopz-ptt.user.js` | 油猴脚本，不想装扩展时用 |
+| `oopz-ptt.user.js` | 油猴脚本，不想装扩展时用（与扩展二选一，也可以都装） |
 
-扩展和油猴脚本二选一即可。支持 Edge、Chrome 等 Chromium 内核浏览器，本地助手仅支持 Windows 10/11 x64。
+推荐只装一种。两个同时安装也能正常工作：只有先加载的一份生效，另一份自动让位并释放自己的连接，不会出现重复面板或双份连接。支持 Edge、Chrome 等 Chromium 内核浏览器，本地助手仅支持 Windows 10/11 x64。
 
 ## 安装
 
-1. 在 [Releases](https://github.com/IOL0ol1/oopz-ptt/releases/latest) 下载 `OopzPtt-x.y.z-win-x64.zip`，解压到一个固定的位置。
+1. 下载 `OopzPtt-x.y.z-win-x64.zip`，解压到一个固定的位置。国内访问 GitHub 较慢时，用下面的镜像地址：
+
+   | 来源 | 地址 |
+   | --- | --- |
+   | GitHub（官方） | <https://github.com/IOL0ol1/oopz-ptt/releases/latest> |
+   | 镜像 1（推荐） | <https://ghfast.top/https://github.com/IOL0ol1/oopz-ptt/releases/latest> |
+   | 镜像 2 | <https://gh-proxy.com/https://github.com/IOL0ol1/oopz-ptt/releases/latest> |
+   | 镜像 3 | <https://ghproxy.net/https://github.com/IOL0ol1/oopz-ptt/releases/latest> |
+
+   在镜像页面上找到对应版本的 `OopzPtt-x.y.z-win-x64.zip` 下载即可。油猴脚本的 `@downloadURL` / `@updateURL` 已指向镜像 1，自动更新不需要访问 GitHub。
 2. 运行 `OopzPtt.exe`。程序没有代码签名，第一次运行时 Windows 可能提示"已保护你的电脑"，点「更多信息 → 仍要运行」。之后它会出现在托盘，并自动打开 Oopz 网页版。
-3. 安装扩展或油猴脚本（二选一）：
-   - **扩展**：打开 `edge://extensions`（Chrome 为 `chrome://extensions`），打开「开发人员模式」，点「加载解压缩的扩展」，选择解压出来的 `extension` 文件夹。
-   - **油猴脚本**：先安装 [Tampermonkey](https://www.tampermonkey.net/) 或 [Violentmonkey](https://violentmonkey.github.io/)，再打开 `oopz-ptt.user.js` 安装。新版 Chrome / Edge 需要在油猴扩展的详情页里打开「允许用户脚本」。第一次连接时浏览器会询问是否允许 web.oopz.cn 访问本设备上的应用，选「允许」。
+3. 安装扩展或油猴脚本 —— **任选一种即可，两个都装也不会冲突**：
+
+   > **优先只装一种。**
+   >
+   > 两者注入的是同一份页面脚本。从 0.1.5 起做了共存处理：同时安装时只有先加载的一份生效，另一份自动让位并释放自己已经建立的连接，不会出现重复面板，也不会多占一条助手连接。不过多装一份没有额外收益，保留一种即可。
+
+   **方案 A：浏览器扩展（推荐，免每次授权）**
+   - 打开 `edge://extensions`（Chrome 为 `chrome://extensions`），打开「开发人员模式」
+   - 点「加载解压缩的扩展」，选择解压出来的 `extension` 文件夹
+   - 装好后需要刷新已经打开的 Oopz 页面才会生效
+
+   **方案 B：油猴脚本（不想装扩展时用）**
+   - 先安装 [Tampermonkey](https://www.tampermonkey.net/) 或 [Violentmonkey](https://violentmonkey.github.io/)
+   - 打开 `oopz-ptt.user.js` 安装。新版 Chrome / Edge 需要在油猴扩展的详情页里打开「允许用户脚本」
+   - 第一次连接时浏览器会询问是否允许 web.oopz.cn 访问本设备上的应用，选「允许」
 4. 刷新 Oopz 网页，进入「设置 → 语音设置」，在「语音输入模式」选「按键说话」，然后按下想用的按键。
 
 想开机就能用，在托盘菜单里勾选「开机自动启动」。
@@ -46,6 +67,9 @@
 - 托盘菜单的「在网页中打开设置」会在 Oopz 页面上弹出同样的设置面板，不用进设置页。
 
 ## 常见问题
+
+**镜像打不开 / 自动更新失效？**
+镜像都是第三方公益服务，可能随时失效。下载页可换用上表里的其他镜像，或直接访问 GitHub 官方地址。油猴脚本若提示更新失败，手动打开 `oopz-ptt.user.js` 重新安装即可覆盖，设置会保留。
 
 **别人看到我一直是开麦状态？**
 按键说话只决定声音是否发出去，不会切换 Oopz 的闭麦状态，所以别人看到的仍是开麦，没按键时只是听不到声音。Discord、KOOK 的按键说话也是这样。Oopz 自带的闭麦按钮优先级更高，闭麦后按住快捷键也不会出声。
