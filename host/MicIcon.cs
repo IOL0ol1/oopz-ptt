@@ -49,19 +49,14 @@ internal static unsafe class MicIcon
         return icon;
     }
 
-    // 有向距离场：话筒 + 支架 + 立杆 + 底座，坐标归一化到 [0,1]
+    // Oopz 的 Z 形标志：上横 + 对角 + 下横，坐标归一化到 [0,1]
+    // 用有向距离场描述笔画，边缘自动抗锯齿，任意尺寸都清晰
     static float Shape(float x, float y)
     {
-        const float w = 0.05f;
-        float d = Segment(x, y, 0.5f, 0.27f, 0.5f, 0.45f) - 0.15f;
-
-        float rx = x - 0.5f, ry = y - 0.46f;
-        float arc = ry >= 0
-            ? MathF.Abs(MathF.Sqrt(rx * rx + ry * ry) - 0.28f) - w
-            : MathF.Min(Dist(x, y, 0.22f, 0.46f), Dist(x, y, 0.78f, 0.46f)) - w;
-        d = MathF.Min(d, arc);
-        d = MathF.Min(d, Segment(x, y, 0.5f, 0.74f, 0.5f, 0.86f) - w);
-        d = MathF.Min(d, Segment(x, y, 0.34f, 0.88f, 0.66f, 0.88f) - w);
+        const float w = 0.072f;
+        float d = Segment(x, y, 0.25f, 0.30f, 0.75f, 0.30f) - w;
+        d = MathF.Min(d, Segment(x, y, 0.75f, 0.30f, 0.25f, 0.70f) - w);
+        d = MathF.Min(d, Segment(x, y, 0.25f, 0.70f, 0.75f, 0.70f) - w);
         return d;
     }
 

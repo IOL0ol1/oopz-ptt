@@ -24,7 +24,6 @@ internal sealed unsafe class App
     const nuint TimerLearn = 4;
 
     const nuint CmdOpenWeb = 1;
-    const nuint CmdOpenPanel = 2;
     const nuint CmdAutoStart = 3;
     const nuint CmdOpenOnStart = 4;
     const nuint CmdRunAsAdmin = 5;
@@ -560,8 +559,6 @@ internal sealed unsafe class App
         bool connected = _ws.Count > 0;
         bool elevated = Environment.IsPrivilegedProcess;
         AppendMenuW(menu, MF_STRING, CmdOpenWeb, "打开 Oopz 网页版");
-        AppendMenuW(menu, connected ? MF_STRING : MF_GRAYED, CmdOpenPanel, "在网页中打开设置");
-        AppendMenuW(menu, MF_SEPARATOR, 0, null);
         AppendMenuW(menu, IsAutoStart() ? MF_CHECKED : MF_STRING, CmdAutoStart, "开机自动启动");
         AppendMenuW(menu, S.OpenOnStart ? MF_CHECKED : MF_STRING, CmdOpenOnStart, "启动时打开网页");
         AppendMenuW(menu, elevated ? MF_GRAYED : MF_STRING, CmdRunAsAdmin, elevated ? "已以管理员身份运行" : "以管理员身份重新启动");
@@ -580,9 +577,6 @@ internal sealed unsafe class App
         {
             case CmdOpenWeb:
                 OpenWeb();
-                break;
-            case CmdOpenPanel:
-                _ws.Broadcast(Json(new OutMsg { T = "openPanel" }));
                 break;
             case CmdAutoStart:
                 SetAutoStart(!IsAutoStart());

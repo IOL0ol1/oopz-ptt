@@ -3,7 +3,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.1.8';
+  const VERSION = '0.2.2';
   // 传输方式：扩展为 bridge（经扩展后台转发，不触发本地网络权限提示）
   // 打包油猴脚本时替换为 ws（页面直接连本地助手）
   const TRANSPORT = 'bridge';
@@ -501,9 +501,6 @@
         S.learning = false;
         render();
         break;
-      case 'openPanel':
-        if (ui) ui.openModal();
-        break;
     }
   }
 
@@ -717,47 +714,78 @@
   // 饱和度：设置页背景是中性灰，彩色卡片（活动 banner、广告位）饱和度很高
   const chroma = (p) => Math.max(p[0], p[1], p[2]) - Math.min(p[0], p[1], p[2]);
 
-  // 顶栏左侧「麦克风 + 耳机」胶囊里的麦克风图标
+  // 顶栏左侧「麦克风 + 耳机 + 挂断」胶囊里的麦克风图标
+  // 这个图标是细线轮廓、内部空心，颜色还会随静音/开麦在灰绿之间变化，所以既不能找
+  // "连续宽色块"，也不能靠形状或颜色识别。做法分三步：
+  //   1. 取一列，用胶囊的蓝色描边定位上下边界（描边是品牌色，不随状态变）
+  //   2. 在胶囊中心行找出胶囊左边界（不能写死 x：窗口缩放不是 100% 时坐标会整体偏移，
+  //      写死的话会直接跳到耳机甚至头像上）
+  //   3. 在胶囊内部做列投影，第一个有足够像素的列簇就是麦克风图标
   function findMic() {
-    const row = probe.read(112, 31, 320, 1);
-    if (!row) return null;
-    const bg = row.at(0, 0);
-    const run = Math.round(8 * row.s);
-    let L = -1;
-    for (let i = 1; i < row.w - run; i++) {
-      const p = row.at(i, 0);
-      if (diff(p, bg) < 10) continue;
-      let uniform = true;
-      for (let j = 1; j <= run; j++) if (diff(row.at(i + j, 0), p) > 6) { uniform = false; break; }
-      if (uniform) { L = i; break; }
+    const col = probe.read(150, 0, 1, 60);
+    if (!col) return null;
+    let top = -1;
+    let bottom = -1;
+    for (let y = 0; y < col.h; y++) {
+      const p = col.at(0, y);
+      if (p[2] > 90 && p[2] - p[0] > 40) {
+        if (top < 0) top = y;
+        bottom = y;
+      }
     }
-    if (L < 0) return null;
-    const pill = row.at(L, 0);
+    if (top < 0 || bottom - top < 10) return null;
+    const pillTop = col.y0 + top / col.s;
+    const pillBottom = col.y0 + (bottom + 1) / col.s;
+    const pillH = pillBottom - pillTop;
+    if (pillH < 8) return null;
+    const cy = (pillTop + pillBottom) / 2;
+
+    // 胶囊左边界：从 logo 右侧起扫，找到第一段与页面背景不同的像素
+    const scan = probe.read(85, Math.round(cy), 220, 1);
+    if (!scan) return null;
+    const pageBg = scan.at(0, 0);
+    let Lpx = -1;
+    for (let i = 0; i < scan.w; i++) {
+      if (diff(scan.at(i, 0), pageBg) > 12) { Lpx = i; break; }
+    }
+    if (Lpx < 0) return null;
+    const left = scan.x0 + Lpx / scan.s;
+
+    const by = Math.round(pillTop + 3);
+    const bh = Math.max(6, Math.round(pillH - 6));
+    const blk = probe.read(left + 5, by, 200, bh);
+    if (!blk) return null;
+    const pill = blk.at(2, Math.round(blk.h / 2));
+
+    // 图标之间相隔约 15px，图标内部空隙更大，用 10px 空白作为分界；
+    // 细线图标单列可能只有 1~2 个像素，所以阈值取 2
+    const gapMin = Math.round(10 * blk.s);
     let g0 = -1;
     let g1 = -1;
-    let gap = 0;
-    for (let i = L; i < row.w; i++) {
-      if (diff(row.at(i, 0), pill) > 40) {
-        if (g0 < 0) g0 = i;
-        g1 = i;
-        gap = 0;
-      } else if (g0 >= 0 && ++gap > Math.round(5 * row.s)) break;
+    let zero = 0;
+    for (let x = 0; x < blk.w; x++) {
+      let n = 0;
+      for (let y = 0; y < blk.h; y++) if (diff(blk.at(x, y), pill) > 30) n++;
+      if (n >= 2) {
+        if (g0 < 0) g0 = x;
+        g1 = x;
+        zero = 0;
+      } else if (g0 >= 0 && ++zero > gapMin) {
+        break;
+      }
     }
     if (g0 < 0) return null;
-    const width = (g1 + 1 - g0) / row.s;
-    if (width < 4 || width > 26) return null;
-    const cx = row.x0 + (g0 + g1 + 1) / 2 / row.s;
-    const left = row.x0 + L / row.s;
-
-    const col = probe.read(left + 3, 0, 1, 70);
-    if (!col) return null;
-    const mid = Math.round((31 - col.y0) * col.s);
-    let top = mid;
-    let bottom = mid;
-    while (top > 0 && diff(col.at(0, top - 1), pill) < 8) top--;
-    while (bottom < col.h - 1 && diff(col.at(0, bottom + 1), pill) < 8) bottom++;
-    const cy = col.y0 + (top + bottom + 1) / 2 / col.s;
-    return { cx, cy, left, pill, bg };
+    const iw = (g1 + 1 - g0) / blk.s;
+    if (iw < 4 || iw > 30) return null;
+    return {
+      cx: blk.x0 + (g0 + g1 + 1) / 2 / blk.s,
+      cy,
+      left,
+      pill,
+      bg: pill,
+      w: iw,
+      h: Math.max(8, pillH - 8),
+    };
   }
 
   // 语音设置页「语音输入模式」下的「自由发言」单选钮
@@ -855,29 +883,18 @@ a { color: var(--accent); text-decoration: none; cursor: pointer; }
 a:hover { text-decoration: underline; }
 .badge { position: absolute; display: none; width: 0; height: 0; }
 .badge.show { display: block; }
-.badge i { position: absolute; left: 3px; top: 2px; width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--pill);
+.badge i { position: absolute; left: -5px; top: -5px; width: 7px; height: 7px; border-radius: 50%; border: 2px solid var(--pill);
   background: #8c8c8c; transition: box-shadow .1s, background-color .15s; }
-.mask { position: absolute; inset: 0; pointer-events: auto; background: rgba(0,0,0,.45); display: none; align-items: center; justify-content: center; }
-.mask.show { display: flex; }
-.card { width: 600px; max-width: calc(100vw - 32px); background: var(--pill); border: 1px solid #2c2c2c; border-radius: 12px;
-  box-shadow: 0 12px 40px rgba(0,0,0,.45); padding: 20px 24px 22px; color: var(--fg2); font-size: 14px; }
-.card .top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
-.card .x { width: 28px; height: 28px; border: 0; border-radius: 6px; background: transparent; color: var(--fg3); font-size: 18px; cursor: pointer; }
-.card .x:hover { background: rgba(255,255,255,.06); color: var(--fg1); }
-.card .row { display: flex; align-items: center; min-height: 28px; white-space: nowrap; margin-bottom: 6px; }
-.card .row.h { margin-top: 18px; margin-bottom: 8px; }
-.card .row.hint { white-space: normal; line-height: 20px; }
 .toast { position: absolute; left: 50%; bottom: 48px; transform: translateX(-50%); background: rgba(30,30,30,.96); color: var(--fg1);
   border: 1px solid #333; border-radius: 8px; padding: 8px 14px; font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; }
 .toast.show { opacity: 1; }
-.light .card { border-color: #e2e2e2; box-shadow: 0 12px 40px rgba(0,0,0,.15); }
 .light .toast { background: rgba(255,255,255,.98); border-color: #ddd; }
 `;
 
   // 相对「自由发言」单选钮圆心的纵向位置，按 Oopz 1.4.x 实测
   const ROW = { radio: 0, hint: 29, header: 96, keys: 128 };
 
-  function buildControls(el, inline) {
+  function buildControls(el) {
     el.innerHTML = `
       <div class="row r-mode"><span class="radio" data-mode="free"><i></i>自由发言</span><span class="radio" data-mode="ptt"><i></i>按键说话</span></div>
       <div class="row r-hint hint"></div>
@@ -923,11 +940,11 @@ a:hover { text-decoration: underline; }
         range.style.setProperty('--p', (S.cfg.delay / 10) + '%');
         val.textContent = S.cfg.delay + ' 毫秒';
       }
-      hint.innerHTML = statusHtml(inline);
+      hint.innerHTML = statusHtml();
     };
   }
 
-  function statusHtml(inline) {
+  function statusHtml() {
     const ptt = S.cfg.mode === 'ptt';
     if (S.host) {
       const v = S.hostVersion ? ` v${S.hostVersion}` : '';
@@ -942,7 +959,7 @@ a:hover { text-decoration: underline; }
       return warn + '如果浏览器询问是否允许访问本设备上的应用，请选择「允许」';
     }
     const dl = `<a href="${HOME_URL}/releases/latest" target="_blank" rel="noopener">下载本地助手</a>`;
-    return warn + '未连接本地助手，快捷键只在本页面处于前台时有效。' + (inline ? dl : '运行 OopzPtt.exe 后自动连接，' + dl);
+    return warn + '未连接本地助手，快捷键只在本页面处于前台时有效。' + dl;
   }
 
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -963,6 +980,8 @@ a:hover { text-decoration: underline; }
   }
 
   let ui = null;
+  // 右键会弹出 Oopz 自己的竖排菜单，脚本面板如果还留在原地就会和它叠在一起
+  let inlineSuspended = false;
 
   function createUi() {
     const hostEl = document.createElement('oopz-ptt');
@@ -971,7 +990,6 @@ a:hover { text-decoration: underline; }
       <div class="layer">
         <div class="badge"><i></i></div>
         <div class="inline"></div>
-        <div class="mask"><div class="card"><div class="top"><span class="h">按键说话</span><button class="x" type="button" title="关闭">×</button></div><div class="body"></div></div></div>
         <div class="toast"></div>
       </div>`;
     document.documentElement.appendChild(hostEl);
@@ -980,20 +998,15 @@ a:hover { text-decoration: underline; }
     const badge = root.querySelector('.badge');
     const badgeDot = badge.querySelector('i');
     const inline = root.querySelector('.inline');
-    const mask = root.querySelector('.mask');
-    const card = root.querySelector('.card');
     const toastEl = root.querySelector('.toast');
 
-    const updInline = buildControls(inline, true);
-    const updModal = buildControls(card.querySelector('.body'), false);
+    const updInline = buildControls(inline);
     // 面板顶部 = 圆心 - 14，每行高 28，所以行的 top 就等于该行中心相对圆心的偏移
     const rows = inline.querySelectorAll('.row');
     [ROW.radio, ROW.hint, ROW.header, ROW.keys].forEach((y, i) => { rows[i].style.top = y + 'px'; });
 
-    for (const el of [inline, mask]) {
-      for (const t of ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu', 'keydown', 'keyup']) {
-        el.addEventListener(t, (e) => e.stopPropagation());
-      }
+    for (const t of ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu', 'keydown', 'keyup']) {
+      inline.addEventListener(t, (e) => e.stopPropagation());
     }
     // 面板盖住了 Flutter，滚轮转发回去，让设置页照常滚动
     inline.addEventListener('wheel', (e) => {
@@ -1009,12 +1022,6 @@ a:hover { text-decoration: underline; }
         }));
       }
     }, { passive: false });
-    mask.addEventListener('wheel', (e) => e.stopPropagation(), { passive: true });
-    mask.addEventListener('click', (e) => { if (e.target === mask) closeModal(); });
-    card.querySelector('.x').addEventListener('click', closeModal);
-    window.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && mask.classList.contains('show') && !S.learning) closeModal();
-    }, true);
 
     let anchorVoice = null;
     let anchorMic = null;
@@ -1036,10 +1043,15 @@ a:hover { text-decoration: underline; }
 
     function place() {
       if (anchorMic) {
-        badge.style.left = anchorMic.cx + 'px';
-        badge.style.top = anchorMic.cy + 'px';
+        // 贴在图标右下角，和 Oopz 自己在头像角落画的在线点一致。
+        // 麦克风是斜线图形，中心那一列常常是空的，纵向量出来的高度会偏小，
+        // 所以高度按宽度估算兜底（顶栏图标大致是宽的 1.25 倍）。
+        const iw = anchorMic.w || 14;
+        const ih = Math.max(anchorMic.h || 0, iw * 1.25);
+        badge.style.left = (anchorMic.cx + iw / 2 - 2) + 'px';
+        badge.style.top = (anchorMic.cy + ih / 2 - 2) + 'px';
       }
-      if (anchorVoice) {
+      if (anchorVoice && !inlineSuspended) {
         const left = anchorVoice.cx - 7;
         inline.style.left = left + 'px';
         inline.style.top = (anchorVoice.cy - 14) + 'px';
@@ -1075,17 +1087,6 @@ a:hover { text-decoration: underline; }
         badgeDot.style.boxShadow = glow ? `0 0 0 ${glow}px rgba(59,165,92,${st === 'tail' ? 0.18 : 0.32})` : 'none';
       }
       if (inline.classList.contains('show')) updInline();
-      if (mask.classList.contains('show')) updModal();
-    }
-
-    function openModal() {
-      mask.classList.add('show');
-      update();
-    }
-
-    function closeModal() {
-      if (S.learning) cancelLearn();
-      mask.classList.remove('show');
     }
 
     let toastTimer = 0;
@@ -1097,7 +1098,7 @@ a:hover { text-decoration: underline; }
     }
 
     return {
-      update, setAnchors, hideInline, openModal, showToast,
+      update, setAnchors, hideInline, showToast,
       get anchorMic() { return anchorMic; },
       get anchorVoice() { return anchorVoice; },
     };
@@ -1205,6 +1206,17 @@ a:hover { text-decoration: underline; }
     }, 1500);
 
     const onPointerUp = () => { scheduleScan(250); setTimeout(scan, 900); };
+    // 右键：Oopz 会弹出自己的语音菜单，脚本面板先让开，避免两块 UI 叠在一起；
+    // 左键点回来后恢复显示。
+    window.addEventListener('pointerdown', (e) => {
+      if (e.button === 2) {
+        inlineSuspended = true;
+        ui.hideInline();
+      } else if (e.button === 0 && inlineSuspended) {
+        inlineSuspended = false;
+        scheduleScan(200);
+      }
+    }, true);
     window.addEventListener('pointerup', onPointerUp, true);
     window.addEventListener('keyup', () => scheduleScan(300), true);
     window.addEventListener('wheel', (e) => {
