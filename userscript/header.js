@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Oopz 按键说话
 // @namespace    https://github.com/IOL0ol1/oopz-ptt
-// @version      0.1.6
+// @version      0.1.8
 // @description  为 Oopz 网页版加入全局按键说话，需配合本地助手 OopzPtt.exe 使用
 // @author       IOL0ol1
 // @license      MIT

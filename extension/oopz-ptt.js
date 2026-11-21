@@ -3,12 +3,13 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.1.6';
+  const VERSION = '0.1.8';
   // 传输方式：扩展为 bridge（经扩展后台转发，不触发本地网络权限提示）
   // 打包油猴脚本时替换为 ws（页面直接连本地助手）
   const TRANSPORT = 'bridge';
   const BRIDGE_TAG = '__oopzPtt';
   const IS_BRIDGE = TRANSPORT === 'bridge';
+  const IS_WS = !IS_BRIDGE;
 
   // 扩展和油猴脚本允许同时安装：两者注入的是同一份脚本、同一个 world，只让先到的一方
   // 生效，后来的一方主动让位，并把可能已建立的连接清理掉，避免出现两套界面或一条
@@ -48,6 +49,50 @@
   } else {
     window.__oopzPttUser = VERSION;
   }
+
+  /* ============ 屏蔽首页广告接口 ============ */
+  // Oopz 的开屏推广浮层和首页横幅都由 /advertisement/v2/list 下发。它们整块画在
+  // Flutter 画布上，DOM 里没有节点可删，也没有"浮层出现"事件可以监听，只能在数据
+  // 源头拦掉。实测网络层拦掉这个请求后，浮层和横幅都不再出现，页面其余功能正常。
+  // 这里在页面脚本之前把请求截断，扩展和油猴跑的是同一份代码，两边都生效。
+
+  const AD_URL = /\/advertisement\/v\d+\/list/;
+
+  (() => {
+    try {
+      const of = window.fetch;
+      if (typeof of === 'function') {
+        window.fetch = function (input) {
+          const url = typeof input === 'string' ? input : input && input.url;
+          if (url && AD_URL.test(url)) return Promise.reject(new TypeError('Failed to fetch'));
+          return of.apply(this, arguments);
+        };
+      }
+    } catch (e) { }
+
+    try {
+      const XO = XMLHttpRequest.prototype.open;
+      const XS = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function (method, url) {
+        try { this.__oopzAd = AD_URL.test(String(url)); } catch (e) { }
+        return XO.apply(this, arguments);
+      };
+      XMLHttpRequest.prototype.send = function () {
+        if (!this.__oopzAd) return XS.apply(this, arguments);
+        // 按网络失败处理，和请求被 block 的表现一致，页面已验证能正常降级
+        try {
+          Object.defineProperty(this, 'readyState', { configurable: true, get: () => 4 });
+          Object.defineProperty(this, 'status', { configurable: true, get: () => 0 });
+        } catch (e) { }
+        setTimeout(() => {
+          for (const t of ['readystatechange', 'error', 'loadend']) {
+            try { this.dispatchEvent(new ProgressEvent(t)); } catch (e) { }
+          }
+        }, 0);
+        return undefined;
+      };
+    } catch (e) { }
+  })();
 
   /* ============ 配置 ============ */
 
@@ -345,8 +390,10 @@
   let retryTimer = 0;
   let lna = '';
 
-  function connect() {
-    if (TRANSPORT === 'bridge') {
+  // 扩展：经 bridge.js 转发，bridge.js 连上本地助手后回传 __up，这时再打招呼。
+  // 油猴：页面自己连 WebSocket。
+  function initTransport() {
+    if (IS_BRIDGE) {
       window.addEventListener('message', (e) => {
         if (e.source !== window || !e.data || e.data[BRIDGE_TAG] !== 'in') return;
         const m = e.data.m;
@@ -355,7 +402,6 @@
         else if (m.t === '__down') hostDown();
         else onHostMessage(m);
       });
-      send({ t: 'hello', v: VERSION });
       return;
     }
     connectWs();
@@ -412,7 +458,7 @@
   }
 
   function send(o) {
-    if (TRANSPORT === 'bridge') {
+    if (IS_BRIDGE) {
       window.postMessage({ [BRIDGE_TAG]: 'out', m: o }, location.origin);
       return S.host || o.t === 'hello';
     }
@@ -889,10 +935,10 @@ a:hover { text-decoration: underline; }
         (ptt ? `在任何程序中按住&nbsp;<b>${esc(bindingName(S.cfg.binding))}</b>&nbsp;即可说话` : '选择按键说话后，按住快捷键才会发送声音');
     }
     const warn = '<span class="dot" style="background:var(--warn)"></span>';
-    if (TRANSPORT === 'ws' && lna === 'denied') {
+    if (IS_WS && lna === 'denied') {
       return warn + '浏览器拦截了本页对本机程序的访问，请在网站设置中允许「本设备上的应用」后刷新';
     }
-    if (TRANSPORT === 'ws' && lna === 'prompt') {
+    if (IS_WS && lna === 'prompt') {
       return warn + '如果浏览器询问是否允许访问本设备上的应用，请选择「允许」';
     }
     const dl = `<a href="${HOME_URL}/releases/latest" target="_blank" rel="noopener">下载本地助手</a>`;
@@ -1106,7 +1152,7 @@ a:hover { text-decoration: underline; }
     scanTimer = setTimeout(scan, delay);
   }
 
-  // 每秒核对一次锚点像素，页面切走就收起；没找到顶栏时降到每 3 秒找一次
+  // 每秒核对一次锚点像素，页面切走就收起；顶栏和设置项都没找到时降到每 2 秒找一次
   let verifyTick = 0;
   function verify() {
     if (!ui || document.hidden) return;
@@ -1183,7 +1229,7 @@ a:hover { text-decoration: underline; }
     else setTimeout(waitForFlutter, 500);
   }
 
-  connect();
+  initTransport();
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', waitForFlutter, { once: true });
   else waitForFlutter();
 })();
