@@ -4,6 +4,7 @@
 // @version      0.2.9
 // @description  为 Oopz 网页版加入全局按键说话，需配合本地助手 OopzPtt.exe 使用
 // @author       IOL0ol1
+// @icon         icon48.png
 // @license      MIT
 // @homepageURL  https://github.com/IOL0ol1/oopz-ptt
 // @supportURL   https://github.com/IOL0ol1/oopz-ptt/issues

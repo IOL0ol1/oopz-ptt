@@ -49,6 +49,12 @@ Compress-Archive -Path (Join-Path $ext '*') -DestinationPath (Join-Path $dist 'o
 $userJs = $pageJs -replace "const TRANSPORT = 'bridge';", "const TRANSPORT = 'ws';"
 if ($userJs -eq $pageJs) { throw '未找到 TRANSPORT 常量' }
 $header = [System.IO.File]::ReadAllText((Join-Path $root 'userscript/header.js'), $utf8) -replace '(// @version\s+)\S+', "`${1}$Version"
+# @icon 写的是 extension/ 下的图标文件名，内嵌成 data URI，与扩展用同一份图标，也不依赖外链
+$iconMatch = [regex]::Match($header, '// @icon\s+(\S+\.png)')
+if (-not $iconMatch.Success) { throw '未找到 @icon' }
+$iconFile = $iconMatch.Groups[1]
+$iconB64 = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes((Join-Path $root "extension/$($iconFile.Value)")))
+$header = $header.Remove($iconFile.Index, $iconFile.Length).Insert($iconFile.Index, "data:image/png;base64,$iconB64")
 [System.IO.File]::WriteAllText((Join-Path $dist 'oopz-ptt.user.js'), $header + "`n" + $userJs, $utf8)
 
 # 5. 打包
