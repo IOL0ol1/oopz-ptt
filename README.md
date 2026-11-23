@@ -109,7 +109,7 @@ Oopz 网页版整页画在一块画布上，设置项是通过识别画面位置
 pwsh scripts/build.ps1
 ```
 
-产物输出到 `dist/`。推送 `v*` 标签时，GitHub Actions 会自动构建并发布 Release。修改图标后运行 `pwsh scripts/make-icons.ps1` 重新生成。
+产物输出到 `dist/`。推送 `v*` 标签时，GitHub Actions 会自动构建并发布 Release。
 
 本地助手的设置保存在 `%APPDATA%\OopzPtt\settings.json`，日志 `host.log` 在同一目录。
 
